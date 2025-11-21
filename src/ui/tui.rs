@@ -1,0 +1,1 @@
+//! Ratatui-based interface placeholder.
