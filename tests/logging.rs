@@ -47,7 +47,8 @@ fn search_logs_backend_selection() {
         .unwrap();
 
     let out = trace.output();
-    assert!(out.contains("backend=tantivy"));
+    eprintln!("logs: {out}");
+    assert!(out.contains("backend=\"tantivy\""));
     assert!(out.contains("search_start"));
 }
 

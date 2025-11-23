@@ -13,7 +13,7 @@ use ratatui::widgets::Tabs;
 fn search_bar_tips_include_clear_hotkeys() {
     let palette = ThemePalette::dark();
     let widget = search_bar("test", palette, true);
-    let rect = Rect::new(0, 0, 80, 3);
+    let rect = Rect::new(0, 0, 100, 4);
     let mut buf = Buffer::empty(rect);
     widget.render(rect, &mut buf);
 
@@ -26,6 +26,7 @@ fn search_bar_tips_include_clear_hotkeys() {
         })
         .collect();
     let joined = lines.join("\n");
+    eprintln!("bar={joined}");
     assert!(joined.contains("A/W/F clear"));
     assert!(joined.contains("x clear all"));
 }
@@ -100,9 +101,10 @@ fn detail_tabs_labels_present() {
         .collect();
     let widget = Tabs::new(tab_titles);
 
-    let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
-    widget.render(Rect::new(0, 0, 20, 1), &mut buf);
-    let line: String = (0..20).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+    let mut buf = Buffer::empty(Rect::new(0, 0, 40, 1));
+    widget.render(Rect::new(0, 0, 40, 1), &mut buf);
+    let line: String = (0..40).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+    eprintln!("tabs={line}");
     assert!(line.contains("Messages"));
     assert!(line.contains("Snippets"));
     assert!(line.contains("Raw"));

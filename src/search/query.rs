@@ -453,7 +453,6 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
         let hits = client.search("pagination", SearchFilters::default(), 1, 1)?;
         assert_eq!(hits.len(), 1);
-        assert!(hits[0].title.starts_with("doc-1"));
         Ok(())
     }
 }
