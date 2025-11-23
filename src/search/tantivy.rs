@@ -93,7 +93,7 @@ impl TantivyIndex {
 pub fn build_schema() -> Schema {
     let mut schema_builder = Schema::builder();
     schema_builder.add_text_field("agent", TEXT | STORED);
-    schema_builder.add_text_field("workspace", TEXT | STORED);
+    schema_builder.add_text_field("workspace", STRING | STORED);
     schema_builder.add_text_field("source_path", STORED);
     schema_builder.add_u64_field("msg_idx", INDEXED | STORED);
     schema_builder.add_i64_field("created_at", INDEXED | STORED);
