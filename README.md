@@ -14,6 +14,13 @@ Load `.env` at startup using dotenvy (see `src/main.rs`); do not use `std::env::
 - `cargo check --all-targets`
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo fmt --check`
+- `cargo test` (unit + snapshots)
+- `cargo test --test install_scripts -- --test-threads=1` (file:// checksum pass/fail for install.sh/install.ps1)
+- `cargo test --test e2e_index_tui -- --test-threads=1` (index --full then `tui --once` headless)
+
+Env knobs:
+- `TUI_HEADLESS=1` with `coding-agent-search tui --once` skips terminal setup for CI.
+- `--data-dir` flag on `index` and `tui` allows isolated test dirs; `XDG_DATA_HOME` also respected.
 
 ## Install
 - Shell (Linux/macOS): `curl -fsSL https://raw.githubusercontent.com/coding-agent-search/coding-agent-search/main/install.sh | sh`  
@@ -24,6 +31,7 @@ Load `.env` at startup using dotenvy (see `src/main.rs`); do not use `std::env::
 
 ## Usage (TUI & indexing)
 - Quickstart: `coding-agent-search index --full` (first run) then `coding-agent-search tui`.
+- Headless smoke: `TUI_HEADLESS=1 coding-agent-search tui --once --data-dir <dir>` (used in CI).
 - Toggle detailed hotkey legend with `?` (initially shown). Open selected hit in your editor with `o` (uses `$EDITOR` + `$EDITOR_LINE_FLAG`, defaults `vi` and `+` for line jumps).
 - Filter hotkeys: `a/w/f/t` to add agent/workspace/time filters, uppercase `A/W/F` to clear each, `x` to clear all; filter pills show their clear keys.
 - Indexing full rebuild: `coding-agent-search index --full` truncates SQLite tables and Tantivy, then re-ingests—never deletes source logs.
