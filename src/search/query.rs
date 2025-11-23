@@ -62,11 +62,26 @@ impl SearchClient {
         offset: usize,
     ) -> Result<Vec<SearchHit>> {
         if let Some((reader, fields)) = &self.reader {
+            tracing::info!(
+                backend = "tantivy",
+                query = query,
+                limit = limit,
+                offset = offset,
+                "search_start"
+            );
             return self.search_tantivy(reader, fields, query, filters, limit, offset);
         }
         if let Some(conn) = &self.sqlite {
+            tracing::info!(
+                backend = "sqlite",
+                query = query,
+                limit = limit,
+                offset = offset,
+                "search_start"
+            );
             return self.search_sqlite(conn, query, filters, limit, offset);
         }
+        tracing::info!(backend = "none", query = query, "search_start");
         Ok(Vec::new())
     }
 
@@ -326,6 +341,119 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].agent, "codex");
         assert!(hits[0].snippet.contains("hello"));
+        Ok(())
+    }
+
+    #[test]
+    fn search_honors_created_range_and_workspace() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        let conv_a = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("needle one".into()),
+            workspace: Some(std::path::PathBuf::from("/ws/a")),
+            source_path: dir.path().join("a.jsonl"),
+            started_at: Some(10),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(10),
+                content: "alpha needle".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![NormalizedSnippet {
+                    file_path: None,
+                    start_line: None,
+                    end_line: None,
+                    language: None,
+                    snippet_text: None,
+                }],
+            }],
+        };
+        let conv_b = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("needle two".into()),
+            workspace: Some(std::path::PathBuf::from("/ws/b")),
+            source_path: dir.path().join("b.jsonl"),
+            started_at: Some(20),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(20),
+                content: "\nneedle second line".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![NormalizedSnippet {
+                    file_path: None,
+                    start_line: None,
+                    end_line: None,
+                    language: None,
+                    snippet_text: None,
+                }],
+            }],
+        };
+        index.add_conversation(&conv_a)?;
+        index.add_conversation(&conv_b)?;
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/b".into());
+        filters.created_from = Some(15);
+        filters.created_to = Some(25);
+
+        let hits = client.search("needle", filters, 10, 0)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].workspace, "/ws/b");
+        assert!(hits[0].snippet.starts_with("needle second line"));
+        Ok(())
+    }
+
+    #[test]
+    fn pagination_skips_results() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        for i in 0..3 {
+            let conv = NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: None,
+                title: Some(format!("doc-{i}")),
+                workspace: Some(std::path::PathBuf::from("/ws/p")),
+                source_path: dir.path().join(format!("{i}.jsonl")),
+                started_at: Some(100 + i),
+                ended_at: None,
+                metadata: serde_json::json!({}),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".into(),
+                    author: None,
+                    created_at: Some(100 + i),
+                    content: "pagination needle".into(),
+                    extra: serde_json::json!({}),
+                    snippets: vec![NormalizedSnippet {
+                        file_path: None,
+                        start_line: None,
+                        end_line: None,
+                        language: None,
+                        snippet_text: None,
+                    }],
+                }],
+            };
+            index.add_conversation(&conv)?;
+        }
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let hits = client.search("pagination", SearchFilters::default(), 1, 1)?;
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].title.starts_with("doc-1"));
         Ok(())
     }
 }
