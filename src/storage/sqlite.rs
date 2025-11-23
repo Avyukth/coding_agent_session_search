@@ -512,9 +512,6 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         v => return Err(anyhow!("unsupported schema version {}", v)),
     }
 
-    // Ensure fts_messages matches latest shape even if the version was already current.
-    conn.execute_batch(MIGRATION_V3)?;
-
     Ok(())
 }
 

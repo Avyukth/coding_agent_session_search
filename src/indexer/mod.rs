@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use notify::{RecursiveMode, Watcher, recommended_watcher};
@@ -69,8 +69,17 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
     if opts.watch {
         let opts_clone = opts.clone();
         let state = Arc::new(Mutex::new(load_watch_state(&opts.data_dir)));
+        let storage = Arc::new(Mutex::new(storage));
+        let t_index = Arc::new(Mutex::new(t_index));
+
         watch_sources(move |paths| {
-            let _ = reindex_paths(&opts_clone, paths, state.clone());
+            let _ = reindex_paths(
+                &opts_clone,
+                paths,
+                state.clone(),
+                storage.clone(),
+                t_index.clone(),
+            );
         })?;
     }
 
@@ -101,15 +110,25 @@ fn watch_sources<F: Fn(Vec<PathBuf>) + Send + 'static>(callback: F) -> Result<()
     }
 
     let debounce = Duration::from_secs(2);
-    let mut last = Instant::now();
+    let mut pending: Vec<PathBuf> = Vec::new();
+
     loop {
-        if let Ok(paths) = rx.recv()
-            && last.elapsed() >= debounce
-        {
-            callback(paths);
-            last = Instant::now();
+        if pending.is_empty() {
+            match rx.recv() {
+                Ok(paths) => pending.extend(paths),
+                Err(_) => break, // Channel closed
+            }
+        } else {
+            match rx.recv_timeout(debounce) {
+                Ok(paths) => pending.extend(paths),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    callback(std::mem::take(&mut pending));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
     }
+    Ok(())
 }
 
 fn watch_roots() -> Vec<PathBuf> {
@@ -139,7 +158,7 @@ fn watch_roots() -> Vec<PathBuf> {
 
 fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
     storage.raw().execute_batch(
-        r#"
+        r#""
         DELETE FROM fts_messages;
         DELETE FROM snippets;
         DELETE FROM messages;
@@ -148,7 +167,7 @@ fn reset_storage(storage: &mut SqliteStorage) -> Result<()> {
         DELETE FROM workspaces;
         DELETE FROM tags;
         DELETE FROM conversation_tags;
-    "#,
+    ""#,
     )?;
     Ok(())
 }
@@ -157,13 +176,19 @@ fn reindex_paths(
     opts: &IndexOptions,
     paths: Vec<PathBuf>,
     state: Arc<Mutex<HashMap<ConnectorKind, i64>>>,
+    storage: Arc<Mutex<SqliteStorage>>,
+    t_index: Arc<Mutex<TantivyIndex>>,
 ) -> Result<()> {
-    let mut storage = SqliteStorage::open(&opts.db_path)?;
-    let mut t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir)?)?;
+    let mut storage = storage
+        .lock()
+        .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+    let mut t_index = t_index
+        .lock()
+        .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
 
     let triggers = classify_paths(paths);
     if triggers.is_empty() {
-        return Ok(());
+        return Ok(())
     }
 
     for (kind, ts) in triggers {
@@ -503,11 +528,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let codex = tmp.path().join(".codex/sessions/rollout-1.jsonl");
         std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
-        std::fs::write(&codex, "{}\n{}").unwrap();
+        std::fs::write(&codex, "{{}}\n{{}}").unwrap();
 
         let claude = tmp.path().join("project/.claude.json");
         std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
-        std::fs::write(&claude, "{}").unwrap();
+        std::fs::write(&claude, "{{}}").unwrap();
 
         let paths = vec![codex.clone(), claude.clone()];
         let classified = classify_paths(paths);
@@ -556,15 +581,14 @@ mod tests {
         let amp_file = amp_dir.join("thread-002.json");
         std::fs::write(
             &amp_file,
-            r#"{
+            r#"{{
   "id": "thread-002",
   "title": "Amp test",
   "messages": [
-    {"role":"user","text":"hi","createdAt":1700000000100},
-    {"role":"assistant","text":"hello","createdAt":1700000000200}
+    {{"role":"user","text":"hi","createdAt":1700000000100}},
+    {{"role":"assistant","text":"hello","createdAt":1700000000200}}
   ]
-}
-"#,
+}} "#,
         )
         .unwrap();
 
@@ -574,9 +598,16 @@ mod tests {
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
         };
+        
+        // Manually set up dependencies for reindex_paths
+        let storage = SqliteStorage::open(&opts.db_path).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir).unwrap()).unwrap();
 
         let state = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        reindex_paths(&opts, vec![amp_file.clone()], state.clone()).unwrap();
+        let storage = std::sync::Arc::new(std::sync::Mutex::new(storage));
+        let t_index = std::sync::Arc::new(std::sync::Mutex::new(t_index));
+        
+        reindex_paths(&opts, vec![amp_file.clone()], state.clone(), storage, t_index).unwrap();
 
         let loaded = load_watch_state(&data_dir);
         assert!(loaded.contains_key(&ConnectorKind::Amp));
@@ -601,7 +632,7 @@ mod tests {
             .collect();
         if !cols.iter().any(|c| c == "created_at") {
             conn.execute_batch(
-                r#"
+                r#""
 DROP TABLE IF EXISTS fts_messages;
 CREATE VIRTUAL TABLE fts_messages USING fts5(
     content,
@@ -613,7 +644,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
     message_id UNINDEXED,
     tokenize='porter'
 );
-"#,
+""#,
             )
             .unwrap();
         }
