@@ -221,7 +221,6 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
     let mut theme_dark = true;
     // Show onboarding overlay on first launch; user can dismiss with '?'.
     let mut show_help = true;
-    let mut last_error: Option<String> = None;
     let mut cached_detail: Option<(String, ConversationView)> = None;
     let mut last_query = String::new();
     let mut needs_draw = true;
@@ -828,7 +827,6 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                     match client.search(&query, filters.clone(), page_size, page * page_size) {
                         Ok(hits) => {
                             dirty_since = None;
-                            last_error = None;
                             if hits.is_empty() && page > 0 {
                                 page = page.saturating_sub(1);
                                 selected = None;
@@ -855,8 +853,8 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                         }
                         Err(err) => {
                             dirty_since = None;
-                            last_error = Some(format!("Search error: {err}"));
                             status = "Search error (see footer).".to_string();
+                            tracing::warn!("search error: {err}");
                             results.clear();
                             needs_draw = true;
                         }
