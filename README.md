@@ -33,15 +33,16 @@ install.ps1 -EasyMode -Verify
 - **Installer**: curl|bash or pwsh with checksum enforcement, optional artifact override, easy/normal modes, rustup nightly bootstrap, PATH hints, self-test and quickstart hooks.
 - **Tests & CI**: unit, connector fixtures, storage/indexer/search/TUI snapshots, installer e2e (file:// artifacts), headless TUI smoke; CI runs fmt/clippy/check/test + e2e.
 
-### UI / interaction model (rules of the road)
-- **Default search mode**: prefix matching with automatic `*`; toggle via `F9` (prefix ⇄ standard).
-- **Ranking**: `F12` cycles recent-heavy → balanced → relevance-heavy; recency uses conversation timestamps when present.
-- **Filters as chips**: agent/workspace/time shown inline in the search bar; Backspace on empty query removes the newest filter; Enter on empty query lets you edit the newest filter.
-- **Context window**: `F7` cycles S/M/L/XL snippet size; `Space` temporarily peeks XL for the active hit, then returns.
-- **Density**: `Shift+=/+` increases per-pane items, `-` decreases (bounded 4–50); panes auto-collapse when a tool has no hits.
-- **Panes**: one pane per agent with fixed colors; Left/Right switches panes; `Alt+NumPad 1-9` jumps; `g/G` first/last in pane.
-- **Empty state**: before typing, recent per-agent conversations are shown; empty query also lists recent queries you can pick with Enter.
-- **State persistence**: match mode, context size (and soon pane/weight presets) stored in `tui_state.json` in the data dir—delete to reset.
+### TUI keymap (current)
+- Search: type to filter; `/` focuses query. `Ctrl-R` cycles query history. `y` copies path (Results) or content (Detail) to clipboard.
+- Navigation: `Up/Down` move selection/scroll; `Left/Right` switch panes (Results) or focus back (Detail); `Tab` toggles focus (Results ⇄ Detail).
+- Detail: `[` / `]` cycles tabs (Messages/Snippets/Raw). `Up/Down` scrolls content when focused.
+- Filters: `F3` agent, `F4` workspace, `F5/F6` time range; `Shift+F3` scope to active agent; `Shift+F4` clear agent scope; `Shift+F5` cycle time presets (24h/7d/30d/all); `F11` clear all filters.
+- Modes: `F9` toggles match mode (prefix ↔ standard). `F12` cycles ranking (recent-heavy → balanced → relevance-heavy). `F2` toggles theme.
+- Context: `F7` cycles context window (S/M/L/XL); `Space` temporarily peeks XL then returns.
+- Density: `Shift+=/+` increase per-pane items, `-` decrease (min 4, max 50).
+- Actions: `Enter`/`F8` open hit in `$EDITOR`; `Esc`/`F10` quit (or back from Detail focus).
+- Empty state: shows recent per-agent conversations before typing; recent queries list when query is empty.
 
 ## 🚀 Quickstart
 1) **Install** (easy-mode shown):

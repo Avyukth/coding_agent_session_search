@@ -72,73 +72,87 @@ pub enum Commands {
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    // Determine data_dir early for logging
-    let data_dir = match &cli.command {
-        Some(Commands::Tui { data_dir, .. }) => data_dir.clone(),
-        Some(Commands::Index { data_dir, .. }) => data_dir.clone(),
-        _ => None,
-    }
-    .unwrap_or_else(default_data_dir);
-
-    std::fs::create_dir_all(&data_dir).ok();
-
-    // Initialize logging to file
-    let file_appender = tracing_appender::rolling::daily(&data_dir, "cass.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    
-    // If TUI is NOT running (e.g. Index command or explicit Tui with once?), we might want stdout?
-    // But user wants "nicely indexed... in background".
-    // Let's log to file always for consistency, and maybe stdout if not TUI?
-    // Actually, for TUI apps, file logging is best.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(non_blocking).compact().with_target(false).with_ansi(false))
-        .init();
-
     let command = cli.command.unwrap_or(Commands::Tui {
         once: false,
         data_dir: None,
     });
 
-    match command {
-        Commands::Tui { once, data_dir } => {
-            maybe_prompt_for_update(once).await?;
-            
-            // Spawn background indexer if not in once mode (unless we want it there too? probably not for CI)
-            if !once {
-                let bg_data_dir = data_dir.clone().unwrap_or_else(default_data_dir);
-                let bg_db = cli.db.clone();
-                spawn_background_indexer(bg_data_dir, bg_db);
-            }
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-            // Re-resolve data_dir for TUI (it handles None -> default internally, but we passed None above if not set)
-            ui::tui::run_tui(data_dir, once)
+    match &command {
+        Commands::Tui { data_dir, .. } => {
+            // TUI mode: Log to file to avoid breaking the UI
+            let log_dir = data_dir.clone().unwrap_or_else(default_data_dir);
+            std::fs::create_dir_all(&log_dir).ok();
+            
+            let file_appender = tracing_appender::rolling::daily(&log_dir, "cass.log");
+            let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+            
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer().with_writer(non_blocking).compact().with_target(false).with_ansi(false))
+                .init();
+
+            // We must keep _guard alive? No, init() sets the global subscriber. 
+            // But non_blocking writer needs the guard to stay alive to flush on drop.
+            // Since run() is async and runs until exit, we can keep _guard here?
+            // No, match arms have different scopes.
+            // Solution: Initialize logging *before* match, but conditionally.
+            // But `non_blocking` returns a guard that must be bound.
+            // Refactor: 
+            // We can't easily conditionally init the global subscriber with a guard in a match arm and have it live for the duration of `run` if `run` continues after match (it doesn't, it returns).
+            // Actually, we can just run the TUI logic inside the match arm, keeping `_guard` alive there.
+            
+            maybe_prompt_for_update(matches!(command, Commands::Tui { once: true, .. })).await?;
+            
+            if let Commands::Tui { once: false, .. } = &command {
+                 let bg_data_dir = log_dir.clone();
+                 let bg_db = cli.db.clone();
+                 spawn_background_indexer(bg_data_dir, bg_db);
+            }
+            
+            if let Commands::Tui { once, data_dir } = command {
+                 ui::tui::run_tui(data_dir, once)?;
+            }
         }
-        Commands::Index {
-            full,
-            watch,
-            data_dir,
-        } => run_index_with_data(cli.db, full, watch, data_dir),
-        Commands::Completions { shell } => {
-            let mut cmd = Cli::command();
-            clap_complete::generate(
-                shell,
-                &mut cmd,
-                "cass",
-                &mut std::io::stdout(),
-            );
-            Ok(())
+        Commands::Index { .. } => {
+            // CLI mode: Log to stderr so user sees progress
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .compact()
+                .with_target(false)
+                .init();
+                
+            if let Commands::Index { full, watch, data_dir } = command {
+                run_index_with_data(cli.db, full, watch, data_dir)?;
+            }
         }
-        Commands::Man => {
-            let cmd = Cli::command();
-            let man = clap_mangen::Man::new(cmd);
-            let mut out = std::io::stdout();
-            man.render(&mut out)?;
-            Ok(())
+        _ => {
+             // Completions/Man: No logging needed usually, or stderr
+             tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .compact()
+                .with_target(false)
+                .init();
+             
+             match command {
+                 Commands::Completions { shell } => {
+                    let mut cmd = Cli::command();
+                    clap_complete::generate(shell, &mut cmd, "cass", &mut std::io::stdout());
+                 }
+                 Commands::Man => {
+                    let cmd = Cli::command();
+                    let man = clap_mangen::Man::new(cmd);
+                    man.render(&mut std::io::stdout())?;
+                 }
+                 _ => {}
+             }
         }
     }
+
+    Ok(())
 }
 
 fn spawn_background_indexer(data_dir: PathBuf, db: Option<PathBuf>) {

@@ -143,14 +143,15 @@ fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
         &[
             "Arrows move; Left/Right pane; PgUp/PgDn page",
             "Alt+NumPad 1-9 jump pane; g/G jump first/last item",
-            "Tab / Shift-Tab cycle detail tabs",
+            "Tab toggles focus (Results ⇄ Detail)",
+            "[ / ] cycle detail tabs (Messages/Snippets/Raw)",
         ],
     ));
     lines.extend(add_section(
         "Actions",
         &[
-            "Enter/F8 open hit in $EDITOR; planned: Ctrl+Enter queue, Ctrl+O open queued",
-            "F1 toggle this help; Esc/F10 quit",
+            "Enter/F8 open hit in $EDITOR; y copy path/content",
+            "F1 toggle this help; Esc/F10 quit (or back from detail)",
         ],
     ));
     lines.extend(add_section(
@@ -409,11 +410,17 @@ fn format_ts(ms: i64) -> String {
         .unwrap_or_else(|| ms.to_string())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusRegion {
+    Results,
+    Detail,
+}
+
 pub fn footer_legend(show_help: bool) -> &'static str {
     if show_help {
-        "Esc/F10 quit • arrows + Left/Right pane • PgUp/PgDn page • Tab detail • F3/F4/F5/F6 filters • F11 clear • F7 context • F9 mode • F2 theme • Enter/F8 open • Alt+NumPad 1-9 pane • Ctrl-R history"
+        "Esc/F10 quit • arrows + Left/Right pane • PgUp/PgDn page • Tab Focus • [ / ] Tabs • F3/F4/F5/F6 filters • F11 clear • F7 context • F9 mode • F2 theme • Enter/F8 open • Alt+NumPad 1-9 pane • Ctrl-R history • y copy"
     } else {
-        "F1 help | F3 agent | F4 workspace | F5/F6 time | F7 context | F11 clear | F9 mode | F2 theme | Enter/F8 open | Alt+NumPad pane | Esc/F10 quit"
+        "F1 help | F3 agent | F4 workspace | F5/F6 time | F7 context | F11 clear | F9 mode | F2 theme | Enter/F8 open | Alt+NumPad pane | y copy | Esc/F10 quit"
     }
 }
 
@@ -461,6 +468,8 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
     let mut results: Vec<SearchHit> = Vec::new();
     let mut panes: Vec<AgentPane> = Vec::new();
     let mut active_pane: usize = 0;
+    let mut focus_region = FocusRegion::Results;
+    let mut detail_scroll: u16 = 0;
     let mut focus_flash_until: Option<Instant> = None;
     let mut last_tick = Instant::now();
     let tick_rate = Duration::from_millis(30);
@@ -703,6 +712,11 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                             .unwrap_or(false)
                             && idx == active_pane;
 
+                        let is_focused_pane = match focus_region {
+                            FocusRegion::Results => idx == active_pane,
+                            FocusRegion::Detail => false,
+                        };
+
                         let block = Block::default()
                             .title(Span::styled(
                                 format!(
@@ -711,7 +725,7 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                                     pane.hits.len()
                                 ),
                                 Style::default().fg(theme.accent).add_modifier(
-                                    if idx == active_pane {
+                                    if is_focused_pane {
                                         Modifier::BOLD
                                     } else {
                                         Modifier::empty()
@@ -719,7 +733,7 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                                 ),
                             ))
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(if idx == active_pane {
+                            .border_style(Style::default().fg(if is_focused_pane {
                                 theme.accent
                             } else {
                                 palette.hint
@@ -734,7 +748,7 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                             .block(block)
                             .highlight_style(
                                 Style::default()
-                                    .bg(theme.accent)
+                                    .bg(if is_focused_pane { theme.accent } else { palette.hint })
                                     .fg(theme.bg)
                                     .add_modifier(Modifier::BOLD),
                             )
@@ -798,6 +812,8 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                         let loaded = load_conversation(&db_path, &hit.source_path).ok().flatten();
                         if let Some(d) = &loaded {
                             cached_detail = Some((hit.source_path.clone(), d.clone()));
+                            // Reset scroll when loading new conversation
+                            detail_scroll = 0;
                         }
                         loaded
                     };
@@ -853,10 +869,10 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                                     Paragraph::new("No messages")
                                         .style(Style::default().fg(palette.hint))
                                 } else {
-                                    Paragraph::new(lines).wrap(Wrap { trim: true })
+                                    Paragraph::new(lines).wrap(Wrap { trim: true }).scroll((detail_scroll, 0))
                                 }
                             } else {
-                                Paragraph::new(hit.content.clone()).wrap(Wrap { trim: true })
+                                Paragraph::new(hit.content.clone()).wrap(Wrap { trim: true }).scroll((detail_scroll, 0))
                             }
                         }
                         DetailTab::Snippets => {
@@ -894,7 +910,7 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                                     Paragraph::new("No snippets attached.")
                                         .style(Style::default().fg(palette.hint))
                                 } else {
-                                    Paragraph::new(lines).wrap(Wrap { trim: true })
+                                    Paragraph::new(lines).wrap(Wrap { trim: true }).scroll((detail_scroll, 0))
                                 }
                             } else {
                                 Paragraph::new("No snippets loaded")
@@ -918,14 +934,23 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                                 }
                                 text.push_str("Metadata:\n");
                                 text.push_str(&meta);
-                                Paragraph::new(text).wrap(Wrap { trim: true })
+                                Paragraph::new(text).wrap(Wrap { trim: true }).scroll((detail_scroll, 0))
                             } else {
                                 Paragraph::new(format!("Path: {}", hit.source_path))
-                                    .wrap(Wrap { trim: true })
+                                    .wrap(Wrap { trim: true }).scroll((detail_scroll, 0))
                             }
                         }
-                    }
-                    .block(Block::default().title("Detail").borders(Borders::ALL));
+                    };
+                    
+                    let is_focused_detail = matches!(focus_region, FocusRegion::Detail);
+                    let block = Block::default()
+                        .title("Detail")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(if is_focused_detail {
+                            palette.accent 
+                        } else {
+                            palette.hint
+                        }));
 
                     let layout = Layout::default()
                         .direction(Direction::Vertical)
@@ -941,7 +966,7 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
 
                     f.render_widget(tab_widget, layout[0]);
                     f.render_widget(Paragraph::new(meta_lines), layout[1]);
-                    f.render_widget(content_para, layout[2]);
+                    f.render_widget(content_para.block(block), layout[2]);
                 } else {
                     f.render_widget(
                         Paragraph::new("Select a result to view details")
@@ -995,6 +1020,11 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
         {
             needs_draw = true;
 
+            // Global quit override
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                break;
+            }
+
             // While help is open, keys scroll the help modal and do not affect panes.
             if show_help {
                 match key.code {
@@ -1037,64 +1067,180 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                                         page = 0;
                                         dirty_since = Some(Instant::now());
                                         status = format!("Loaded query #{next} from history");
+                                        cached_detail = None;
+                                        detail_scroll = 0;
                                     }
                                 }
                             }
-                            KeyCode::Char('c') => break,
                             _ => {}
                         }
                         continue;
                     }
 
                     match key.code {
-                        KeyCode::Esc | KeyCode::F(10) => break,
+                        KeyCode::Esc | KeyCode::F(10) => {
+                            // If in Detail, Esc goes back to Results.
+                            if matches!(focus_region, FocusRegion::Detail) {
+                                focus_region = FocusRegion::Results;
+                                status = "Focus: Results".to_string();
+                            } else {
+                                break;
+                            }
+                        }
                         KeyCode::Down => {
-                            if panes.is_empty()
-                                && query.trim().is_empty()
-                                && !query_history.is_empty()
-                            {
-                                let max_idx = query_history.len().min(5).saturating_sub(1);
-                                let next = suggestion_idx.unwrap_or(0).saturating_add(1);
-                                suggestion_idx = Some(std::cmp::min(next, max_idx));
-                                status = "Enter to load selected recent query".to_string();
-                            } else if let Some(pane) = panes.get_mut(active_pane)
-                                && pane.selected + 1 < pane.hits.len()
-                            {
-                                pane.selected += 1;
+                            match focus_region {
+                                FocusRegion::Results => {
+                                    if panes.is_empty()
+                                        && query.trim().is_empty()
+                                        && !query_history.is_empty()
+                                    {
+                                        let max_idx = query_history.len().min(5).saturating_sub(1);
+                                        let next = suggestion_idx.unwrap_or(0).saturating_add(1);
+                                        suggestion_idx = Some(std::cmp::min(next, max_idx));
+                                        status = "Enter to load selected recent query".to_string();
+                                    } else if let Some(pane) = panes.get_mut(active_pane)
+                                        && pane.selected + 1 < pane.hits.len()
+                                    {
+                                        pane.selected += 1;
+                                        // Re-load details for new selection
+                                        cached_detail = None;
+                                        detail_scroll = 0;
+                                    }
+                                },
+                                FocusRegion::Detail => {
+                                    detail_scroll = detail_scroll.saturating_add(1);
+                                }
                             }
                         }
                         KeyCode::Up => {
-                            if panes.is_empty()
-                                && query.trim().is_empty()
-                                && !query_history.is_empty()
-                            {
-                                let next = suggestion_idx.unwrap_or(0).saturating_sub(1);
-                                suggestion_idx = Some(next);
-                                status = "Enter to load selected recent query".to_string();
-                            } else if let Some(pane) = panes.get_mut(active_pane)
-                                && pane.selected > 0
-                            {
-                                pane.selected -= 1;
+                            match focus_region {
+                                FocusRegion::Results => {
+                                    if panes.is_empty()
+                                        && query.trim().is_empty()
+                                        && !query_history.is_empty()
+                                    {
+                                        let next = suggestion_idx.unwrap_or(0).saturating_sub(1);
+                                        suggestion_idx = Some(next);
+                                        status = "Enter to load selected recent query".to_string();
+                                    } else if let Some(pane) = panes.get_mut(active_pane)
+                                        && pane.selected > 0
+                                    {
+                                        pane.selected -= 1;
+                                        // Re-load details for new selection
+                                        cached_detail = None;
+                                        detail_scroll = 0;
+                                    }
+                                },
+                                FocusRegion::Detail => {
+                                    detail_scroll = detail_scroll.saturating_sub(1);
+                                }
                             }
                         }
                         KeyCode::Left => {
-                            active_pane = active_pane.saturating_sub(1);
-                            focus_flash_until = Some(Instant::now() + Duration::from_millis(220));
+                            match focus_region {
+                                FocusRegion::Results => {
+                                    active_pane = active_pane.saturating_sub(1);
+                                    focus_flash_until = Some(Instant::now() + Duration::from_millis(220));
+                                    cached_detail = None;
+                                    detail_scroll = 0;
+                                },
+                                FocusRegion::Detail => {
+                                    focus_region = FocusRegion::Results;
+                                    status = "Focus: Results".to_string();
+                                }
+                            }
                         }
                         KeyCode::Right => {
-                            if active_pane + 1 < panes.len() {
-                                active_pane += 1;
-                                focus_flash_until =
-                                    Some(Instant::now() + Duration::from_millis(220));
+                            match focus_region {
+                                FocusRegion::Results => {
+                                    if active_pane + 1 < panes.len() {
+                                        active_pane += 1;
+                                        focus_flash_until = Some(Instant::now() + Duration::from_millis(220));
+                                        cached_detail = None;
+                                        detail_scroll = 0;
+                                    } else if !panes.is_empty() {
+                                        // At last pane, switch focus to detail
+                                        focus_region = FocusRegion::Detail;
+                                        status = "Focus: Detail (arrows scroll, Left back)".to_string();
+                                    }
+                                },
+                                FocusRegion::Detail => {
+                                    // Already at rightmost
+                                }
                             }
                         }
                         KeyCode::PageDown => {
-                            page = page.saturating_add(1);
-                            dirty_since = Some(Instant::now());
+                            match focus_region {
+                                FocusRegion::Results => {
+                                    page = page.saturating_add(1);
+                                    dirty_since = Some(Instant::now());
+                                },
+                                FocusRegion::Detail => {
+                                    detail_scroll = detail_scroll.saturating_add(20);
+                                }
+                            }
                         }
                         KeyCode::PageUp => {
-                            page = page.saturating_sub(1);
-                            dirty_since = Some(Instant::now());
+                            match focus_region {
+                                FocusRegion::Results => {
+                                    page = page.saturating_sub(1);
+                                    dirty_since = Some(Instant::now());
+                                },
+                                FocusRegion::Detail => {
+                                    detail_scroll = detail_scroll.saturating_sub(20);
+                                }
+                            }
+                        }
+                        KeyCode::Char('y') => {
+                            if let Some(hit) = active_hit(&panes, active_pane) {
+                                let text_to_copy = if matches!(focus_region, FocusRegion::Detail) {
+                                    if let Some((_, _)) = &cached_detail {
+                                        hit.content.clone()
+                                    } else {
+                                        hit.content.clone()
+                                    }
+                                } else {
+                                    hit.source_path.clone()
+                                };
+                                
+                                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                                {
+                                    use std::process::Stdio;
+                                    let child = std::process::Command::new("sh")
+                                        .arg("-c")
+                                        .arg("if command -v wl-copy >/dev/null; then wl-copy; elif command -v pbcopy >/dev/null; then pbcopy; elif command -v xclip >/dev/null; then xclip -selection clipboard; fi")
+                                        .stdin(Stdio::piped())
+                                        .spawn();
+                                    if let Ok(mut child) = child 
+                                        && let Some(mut stdin) = child.stdin.take() 
+                                    {
+                                        use std::io::Write;
+                                        let _ = stdin.write_all(text_to_copy.as_bytes());
+                                        drop(stdin); // Ensure EOF
+                                        let _ = child.wait();
+                                        status = "Copied to clipboard".to_string();
+                                    } else {
+                                        status = "Clipboard copy failed (missing tool?)".to_string();
+                                    }
+                                }
+                                #[cfg(target_os = "windows")]
+                                {
+                                    let child = std::process::Command::new("powershell")
+                                        .arg("-command")
+                                        .arg("$Input | Set-Clipboard")
+                                        .stdin(std::process::Stdio::piped())
+                                        .spawn();
+                                     if let Ok(mut child) = child 
+                                        && let Some(mut stdin) = child.stdin.take() 
+                                    {
+                                        use std::io::Write;
+                                        let _ = stdin.write_all(text_to_copy.as_bytes());
+                                        drop(stdin);
+                                        let _ = child.wait();
+                                        status = "Copied to clipboard".to_string();
+                                    }
+                                }
+                            }
                         }
                         KeyCode::F(1) => {
                             show_help = !show_help;
@@ -1118,6 +1264,9 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                                 status = format!("Scoped to agent {}", hit.agent);
                                 page = 0;
                                 dirty_since = Some(Instant::now());
+                                focus_region = FocusRegion::Results;
+                                cached_detail = None;
+                                detail_scroll = 0;
                             }
                         }
                         KeyCode::F(3) => {
@@ -1130,6 +1279,9 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                             status = "Scope: all agents".to_string();
                             page = 0;
                             dirty_since = Some(Instant::now());
+                            focus_region = FocusRegion::Results;
+                            cached_detail = None;
+                            detail_scroll = 0;
                         }
                         KeyCode::F(4) => {
                             input_mode = InputMode::Workspace;
@@ -1160,6 +1312,9 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                                 None => "Time preset: all".to_string(),
                             };
                             dirty_since = Some(Instant::now());
+                            focus_region = FocusRegion::Results;
+                            cached_detail = None;
+                            detail_scroll = 0;
                         }
                         KeyCode::F(5) => {
                             input_mode = InputMode::CreatedFrom;
@@ -1209,6 +1364,9 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                                 }
                             );
                             dirty_since = Some(Instant::now());
+                            focus_region = FocusRegion::Results;
+                            cached_detail = None;
+                            detail_scroll = 0;
                         }
                         KeyCode::F(8) => {
                             if let Some(hit) = active_hit(&panes, active_pane) {
@@ -1240,20 +1398,38 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                             dirty_since = Some(Instant::now());
                         }
                         KeyCode::Tab => {
+                            // Toggle focus
+                            focus_region = match focus_region {
+                                FocusRegion::Results => FocusRegion::Detail,
+                                FocusRegion::Detail => FocusRegion::Results,
+                            };
+                            status = match focus_region {
+                                FocusRegion::Results => "Focus: Results".to_string(),
+                                FocusRegion::Detail => "Focus: Detail".to_string(),
+                            };
+                        }
+                        KeyCode::Char(']') => {
                             detail_tab = match detail_tab {
                                 DetailTab::Messages => DetailTab::Snippets,
                                 DetailTab::Snippets => DetailTab::Raw,
                                 DetailTab::Raw => DetailTab::Messages,
                             };
+                            detail_scroll = 0;
                         }
-                        KeyCode::BackTab => {
+                        KeyCode::Char('[') => {
                             detail_tab = match detail_tab {
                                 DetailTab::Messages => DetailTab::Raw,
                                 DetailTab::Snippets => DetailTab::Messages,
                                 DetailTab::Raw => DetailTab::Snippets,
                             };
+                            detail_scroll = 0;
                         }
                         KeyCode::Char(c) => {
+                            // Reset focus to results if typing
+                            if matches!(focus_region, FocusRegion::Detail) {
+                                focus_region = FocusRegion::Results;
+                            }
+                            
                             if key.modifiers.contains(KeyModifiers::ALT) {
                                 if ('1'..='9').contains(&c) {
                                     let target = c.to_digit(10).unwrap_or(1) as usize - 1;
@@ -1261,6 +1437,8 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                                         active_pane = target;
                                         focus_flash_until =
                                             Some(Instant::now() + Duration::from_millis(220));
+                                        cached_detail = None;
+                                        detail_scroll = 0;
                                     }
                                 }
                                 continue;
@@ -1307,6 +1485,8 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                             if c == 'g' {
                                 if let Some(pane) = panes.get_mut(active_pane) {
                                     pane.selected = 0;
+                                    cached_detail = None;
+                                    detail_scroll = 0;
                                 }
                                 continue;
                             }
@@ -1315,6 +1495,8 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                                     && !pane.hits.is_empty()
                                 {
                                     pane.selected = pane.hits.len() - 1;
+                                    cached_detail = None;
+                                    detail_scroll = 0;
                                 }
                                 continue;
                             }
@@ -1323,6 +1505,8 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                             history_cursor = None;
                             suggestion_idx = None;
                             dirty_since = Some(Instant::now());
+                            cached_detail = None;
+                            detail_scroll = 0;
                         }
                         KeyCode::Backspace => {
                             if query.is_empty() {
@@ -1346,6 +1530,8 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                             history_cursor = None;
                             suggestion_idx = None;
                             dirty_since = Some(Instant::now());
+                            cached_detail = None;
+                            detail_scroll = 0;
                         }
                         KeyCode::Enter => {
                             if panes.is_empty() && query.trim().is_empty() {
@@ -1423,6 +1609,8 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                         page = 0;
                         input_mode = InputMode::Query;
                         active_pane = 0;
+                        cached_detail = None;
+                        detail_scroll = 0;
                         status = format!(
                             "Agent filter set to {}",
                             filters
@@ -1434,6 +1622,7 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                         );
                         input_buffer.clear();
                         dirty_since = Some(Instant::now());
+                        focus_region = FocusRegion::Results;
                     }
                     KeyCode::Backspace => {
                         input_buffer.pop();
@@ -1455,6 +1644,8 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                         page = 0;
                         input_mode = InputMode::Query;
                         active_pane = 0;
+                        cached_detail = None;
+                        detail_scroll = 0;
                         status = format!(
                             "Workspace filter set to {}",
                             filters
@@ -1466,6 +1657,7 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                         );
                         input_buffer.clear();
                         dirty_since = Some(Instant::now());
+                        focus_region = FocusRegion::Results;
                     }
                     KeyCode::Backspace => {
                         input_buffer.pop();
@@ -1484,12 +1676,15 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                         page = 0;
                         input_mode = InputMode::Query;
                         active_pane = 0;
+                        cached_detail = None;
+                        detail_scroll = 0;
                         status = format!(
                             "created_from={:?}, created_to={:?}",
                             filters.created_from, filters.created_to
                         );
                         input_buffer.clear();
                         dirty_since = Some(Instant::now());
+                        focus_region = FocusRegion::Results;
                     }
                     KeyCode::Backspace => {
                         input_buffer.pop();
@@ -1508,12 +1703,15 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                         page = 0;
                         input_mode = InputMode::Query;
                         active_pane = 0;
+                        cached_detail = None;
+                        detail_scroll = 0;
                         status = format!(
                             "created_from={:?}, created_to={:?}",
                             filters.created_from, filters.created_to
                         );
                         input_buffer.clear();
                         dirty_since = Some(Instant::now());
+                        focus_region = FocusRegion::Results;
                     }
                     KeyCode::Backspace => {
                         input_buffer.pop();
