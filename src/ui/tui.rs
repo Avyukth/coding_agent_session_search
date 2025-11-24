@@ -22,16 +22,7 @@ use crate::search::query::{SearchClient, SearchFilters, SearchHit};
 use crate::search::tantivy::index_dir;
 use crate::ui::components::theme::ThemePalette;
 use crate::ui::components::widgets::search_bar;
-use crate::ui::data::{ConversationView, load_conversation, role_style};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InputMode {
-    Query,
-    Agent,
-    Workspace,
-    CreatedFrom,
-    CreatedTo,
-}
+use crate::ui::data::{ConversationView, InputMode, load_conversation, role_style};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetailTab {
@@ -472,7 +463,7 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
     let mut active_pane: usize = 0;
     let mut focus_flash_until: Option<Instant> = None;
     let mut last_tick = Instant::now();
-    let tick_rate = Duration::from_millis(120);
+    let tick_rate = Duration::from_millis(30);
     let debounce = Duration::from_millis(60);
     let mut dirty_since: Option<Instant> = Some(Instant::now());
 
@@ -543,7 +534,7 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                 let sb = search_bar(
                     &bar_text,
                     palette,
-                    matches!(input_mode, InputMode::Query),
+                    input_mode,
                     mode_label,
                     chips,
                 );
@@ -625,9 +616,30 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                             )));
                         }
                     } else {
-                        lines.push(Line::from("No results yet - start typing to search."));
+                        lines.push(Line::from("No results found."));
+                        
+                        // Zero-hit suggestions
+                        let mut suggestions = Vec::new();
+                        if !filters.agents.is_empty() {
+                            suggestions.push("Clear agent filter (Shift+F3)");
+                        }
+                        if !filters.workspaces.is_empty() {
+                            suggestions.push("Clear workspace filter (Shift+F4)");
+                        }
+                        if matches!(match_mode, MatchMode::Standard) {
+                            suggestions.push("Try prefix mode (F9)");
+                        }
+                        if !suggestions.is_empty() {
+                             lines.push(Line::from(""));
+                             lines.push(Line::from(Span::styled("Suggestions:", palette.title())));
+                             for s in suggestions {
+                                 lines.push(Line::from(format!("• {s}")));
+                             }
+                        }
+
+                        lines.push(Line::from(""));
                         lines.push(Line::from(Span::raw(
-                            "Tip: toggle F9 prefix mode or clear filters with F7",
+                            "Tip: toggle F9 prefix mode or clear all filters with F11",
                         )));
                     }
 
@@ -939,7 +951,7 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                 }
 
                 let mut footer_line = format!(
-                    "{} | mode:{} | rank:{} | ctx:{} | {}",
+                    "{} | mode:{} | rank:{} | ctx:{}({}) | {}",
                     status,
                     match match_mode {
                         MatchMode::Standard => "standard",
@@ -951,6 +963,7 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                         RankingMode::RelevanceHeavy => "relevance",
                     },
                     context_window.label(),
+                    context_window.size(),
                     footer_legend(show_help)
                 );
                 if peek_badge_until

@@ -3,6 +3,15 @@ use crate::storage::sqlite::SqliteStorage;
 use crate::ui::components::theme::ThemePalette;
 use anyhow::Result;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputMode {
+    Query,
+    Agent,
+    Workspace,
+    CreatedFrom,
+    CreatedTo,
+}
+
 #[derive(Clone, Debug)]
 pub struct ConversationView {
     pub convo: Conversation,

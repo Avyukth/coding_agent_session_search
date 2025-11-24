@@ -4,6 +4,7 @@ use ratatui::widgets::Widget;
 
 use coding_agent_search::ui::components::theme::ThemePalette;
 use coding_agent_search::ui::components::widgets::search_bar;
+use coding_agent_search::ui::data::InputMode;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Tabs;
@@ -14,7 +15,7 @@ fn search_bar_tips_include_clear_hotkeys() {
     let widget = search_bar(
         "test",
         palette,
-        true,
+        InputMode::Query,
         "standard",
         vec![Span::raw("[agent:codex] ")],
     );
@@ -54,7 +55,7 @@ fn filter_pills_render_selected_filters() {
         ),
     ];
 
-    let widget = search_bar("test", palette, true, "standard", chips);
+    let widget = search_bar("test", palette, InputMode::Query, "standard", chips);
     let rect = Rect::new(0, 0, 100, 4);
     let mut buf = Buffer::empty(rect);
     widget.render(rect, &mut buf);

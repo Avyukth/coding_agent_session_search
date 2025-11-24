@@ -4,20 +4,27 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::ui::components::theme::ThemePalette;
+use crate::ui::data::InputMode;
 use ratatui::widgets::Wrap;
 
 pub fn search_bar(
     query: &str,
     palette: ThemePalette,
-    focused: bool,
+    input_mode: InputMode,
     mode_label: &str,
     chips: Vec<Span<'static>>,
 ) -> Paragraph<'static> {
+    let focused = matches!(input_mode, InputMode::Query);
     let title = Span::styled(format!("Search · {mode_label}"), palette.title());
     let style = if focused {
         Style::default().fg(palette.accent)
     } else {
         Style::default().fg(palette.hint)
+    };
+
+    let border_style = match input_mode {
+        InputMode::Query => Style::default().fg(palette.accent_alt),
+        _ => Style::default().fg(palette.accent).bg(palette.surface),
     };
 
     let mut first_line = chips;
@@ -41,7 +48,7 @@ pub fn search_bar(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(palette.accent_alt)),
+                .border_style(border_style),
         )
         .style(Style::default())
         .alignment(Alignment::Left)
