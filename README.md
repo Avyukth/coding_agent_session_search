@@ -33,6 +33,16 @@ install.ps1 -EasyMode -Verify
 - **Installer**: curl|bash or pwsh with checksum enforcement, optional artifact override, easy/normal modes, rustup nightly bootstrap, PATH hints, self-test and quickstart hooks.
 - **Tests & CI**: unit, connector fixtures, storage/indexer/search/TUI snapshots, installer e2e (file:// artifacts), headless TUI smoke; CI runs fmt/clippy/check/test + e2e.
 
+### UI / interaction model (rules of the road)
+- **Default search mode**: prefix matching with automatic `*`; toggle via `F9` (prefix ⇄ standard).
+- **Ranking**: `F12` cycles recent-heavy → balanced → relevance-heavy; recency uses conversation timestamps when present.
+- **Filters as chips**: agent/workspace/time shown inline in the search bar; Backspace on empty query removes the newest filter; Enter on empty query lets you edit the newest filter.
+- **Context window**: `F7` cycles S/M/L/XL snippet size; `Space` temporarily peeks XL for the active hit, then returns.
+- **Density**: `Shift+=/+` increases per-pane items, `-` decreases (bounded 4–50); panes auto-collapse when a tool has no hits.
+- **Panes**: one pane per agent with fixed colors; Left/Right switches panes; `Alt+NumPad 1-9` jumps; `g/G` first/last in pane.
+- **Empty state**: before typing, recent per-agent conversations are shown; empty query also lists recent queries you can pick with Enter.
+- **State persistence**: match mode, context size (and soon pane/weight presets) stored in `tui_state.json` in the data dir—delete to reset.
+
 ## 🚀 Quickstart
 1) **Install** (easy-mode shown):
    ```bash
