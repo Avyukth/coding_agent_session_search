@@ -780,9 +780,9 @@ fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
         "Navigation",
         &[
             "Arrows move; Left/Right pane; PgUp/PgDn page",
-            "Vim: h/j/k/l (left/down/up/right) when results showing",
-            "Alt+NumPad 1-9 jump pane; g/G jump first/last item",
-            "m toggle select; A bulk actions; Esc clears selection",
+            "Alt+h/j/k/l vim-style nav (when results showing)",
+            "Home/End or Alt+g/G jump to first/last item",
+            "Ctrl+M toggle select; A bulk actions; Esc clears selection",
             "Tab toggles focus (Results ⇄ Detail)",
             "[ / ] cycle detail tabs (Messages/Snippets/Raw)",
         ],
@@ -3292,18 +3292,18 @@ pub fn run_tui(
                     });
                     let detail_title = if detail_scroll > 0 {
                         format!(
-                            "Detail ↓{} • [←/→] tabs • c=copy o=open{}",
+                            "Detail ↓{} • [←/→] tabs • Enter=expand{}",
                             detail_scroll,
                             match_badge.as_deref().unwrap_or("")
                         )
                     } else if is_focused_detail {
                         format!(
-                            "Detail • [←/→] tabs • j/k scroll • c=copy o=open e=edit{}",
+                            "Detail • [←/→] tabs • ↑/↓ or Alt+j/k scroll • Enter=expand{}",
                             match_badge.as_deref().unwrap_or("")
                         )
                     } else {
                         format!(
-                            "Detail • [←/→] tabs • c=copy o=open{}",
+                            "Detail • [←/→] tabs • Enter=expand{}",
                             match_badge.as_deref().unwrap_or("")
                         )
                     };
@@ -5061,105 +5061,118 @@ pub fn run_tui(
                                 dirty_since = Some(Instant::now());
                                 continue;
                             }
-                            // Vim-style: g/G jump to first/last only when panes are showing
-                            if c == 'g' && !panes.is_empty() {
-                                if let Some(pane) = panes.get_mut(active_pane) {
-                                    pane.selected = 0;
-                                    cached_detail = None;
-                                    detail_scroll = 0;
-                                }
-                                continue;
-                            }
-                            if c == 'G' && !panes.is_empty() {
-                                if let Some(pane) = panes.get_mut(active_pane)
-                                    && !pane.hits.is_empty()
-                                {
-                                    pane.selected = pane.hits.len() - 1;
-                                    cached_detail = None;
-                                    detail_scroll = 0;
-                                }
-                                continue;
-                            }
-                            // Vim-style navigation: j/k/h/l only when panes are showing
-                            if c == 'j' && !panes.is_empty() {
-                                match focus_region {
-                                    FocusRegion::Results => {
-                                        if let Some(pane) = panes.get_mut(active_pane)
-                                            && pane.selected + 1 < pane.hits.len()
-                                        {
-                                            pane.selected += 1;
+                            // Vim-style navigation with Alt modifier (Alt+h/j/k/l/g/G)
+                            // Only activates when panes are showing
+                            if key.modifiers.contains(KeyModifiers::ALT) && !panes.is_empty() {
+                                match c {
+                                    'g' => {
+                                        // Alt+g = jump to first item
+                                        if let Some(pane) = panes.get_mut(active_pane) {
+                                            pane.selected = 0;
                                             cached_detail = None;
                                             detail_scroll = 0;
                                         }
+                                        continue;
                                     }
-                                    FocusRegion::Detail => {
-                                        detail_scroll = detail_scroll.saturating_add(1);
-                                    }
-                                }
-                                continue;
-                            }
-                            if c == 'k' && !panes.is_empty() {
-                                match focus_region {
-                                    FocusRegion::Results => {
+                                    'G' => {
+                                        // Alt+G = jump to last item
                                         if let Some(pane) = panes.get_mut(active_pane)
-                                            && pane.selected > 0
+                                            && !pane.hits.is_empty()
                                         {
-                                            pane.selected -= 1;
+                                            pane.selected = pane.hits.len() - 1;
                                             cached_detail = None;
                                             detail_scroll = 0;
                                         }
+                                        continue;
                                     }
-                                    FocusRegion::Detail => {
-                                        detail_scroll = detail_scroll.saturating_sub(1);
-                                    }
-                                }
-                                continue;
-                            }
-                            if c == 'h' && !panes.is_empty() {
-                                match focus_region {
-                                    FocusRegion::Results => {
-                                        active_pane = active_pane.saturating_sub(1);
-                                        if active_pane < pane_scroll_offset {
-                                            pane_scroll_offset = active_pane;
-                                        }
-                                        focus_flash_until =
-                                            Some(Instant::now() + Duration::from_millis(220));
-                                        cached_detail = None;
-                                        detail_scroll = 0;
-                                    }
-                                    FocusRegion::Detail => {
-                                        focus_region = FocusRegion::Results;
-                                        status = "Focus: Results".to_string();
-                                    }
-                                }
-                                continue;
-                            }
-                            if c == 'l' && !panes.is_empty() {
-                                match focus_region {
-                                    FocusRegion::Results => {
-                                        if active_pane + 1 < panes.len() {
-                                            active_pane += 1;
-                                            if active_pane >= pane_scroll_offset + MAX_VISIBLE_PANES
-                                            {
-                                                pane_scroll_offset = active_pane
-                                                    .saturating_sub(MAX_VISIBLE_PANES - 1);
+                                    'j' => {
+                                        // Alt+j = down
+                                        match focus_region {
+                                            FocusRegion::Results => {
+                                                if let Some(pane) = panes.get_mut(active_pane)
+                                                    && pane.selected + 1 < pane.hits.len()
+                                                {
+                                                    pane.selected += 1;
+                                                    cached_detail = None;
+                                                    detail_scroll = 0;
+                                                }
                                             }
-                                            focus_flash_until =
-                                                Some(Instant::now() + Duration::from_millis(220));
-                                            cached_detail = None;
-                                            detail_scroll = 0;
-                                        } else {
-                                            focus_region = FocusRegion::Detail;
-                                            status =
-                                                "Focus: Detail (j/k scroll, h back)".to_string();
+                                            FocusRegion::Detail => {
+                                                detail_scroll = detail_scroll.saturating_add(1);
+                                            }
                                         }
+                                        continue;
                                     }
-                                    FocusRegion::Detail => {
-                                        // Already at rightmost
+                                    'k' => {
+                                        // Alt+k = up
+                                        match focus_region {
+                                            FocusRegion::Results => {
+                                                if let Some(pane) = panes.get_mut(active_pane)
+                                                    && pane.selected > 0
+                                                {
+                                                    pane.selected -= 1;
+                                                    cached_detail = None;
+                                                    detail_scroll = 0;
+                                                }
+                                            }
+                                            FocusRegion::Detail => {
+                                                detail_scroll = detail_scroll.saturating_sub(1);
+                                            }
+                                        }
+                                        continue;
                                     }
+                                    'h' => {
+                                        // Alt+h = left pane
+                                        match focus_region {
+                                            FocusRegion::Results => {
+                                                active_pane = active_pane.saturating_sub(1);
+                                                if active_pane < pane_scroll_offset {
+                                                    pane_scroll_offset = active_pane;
+                                                }
+                                                focus_flash_until =
+                                                    Some(Instant::now() + Duration::from_millis(220));
+                                                cached_detail = None;
+                                                detail_scroll = 0;
+                                            }
+                                            FocusRegion::Detail => {
+                                                focus_region = FocusRegion::Results;
+                                                status = "Focus: Results".to_string();
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    'l' => {
+                                        // Alt+l = right pane / focus detail
+                                        match focus_region {
+                                            FocusRegion::Results => {
+                                                if active_pane + 1 < panes.len() {
+                                                    active_pane += 1;
+                                                    if active_pane
+                                                        >= pane_scroll_offset + MAX_VISIBLE_PANES
+                                                    {
+                                                        pane_scroll_offset = active_pane
+                                                            .saturating_sub(MAX_VISIBLE_PANES - 1);
+                                                    }
+                                                    focus_flash_until =
+                                                        Some(Instant::now() + Duration::from_millis(220));
+                                                    cached_detail = None;
+                                                    detail_scroll = 0;
+                                                } else {
+                                                    focus_region = FocusRegion::Detail;
+                                                    status = "Focus: Detail (Alt+j/k scroll, Alt+h back)"
+                                                        .to_string();
+                                                }
+                                            }
+                                            FocusRegion::Detail => {
+                                                // Already at rightmost
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    _ => {}
                                 }
-                                continue;
                             }
+                            // All other characters pass through to query input
                             query.push(c);
                             page = 0;
                             history_cursor = None;
