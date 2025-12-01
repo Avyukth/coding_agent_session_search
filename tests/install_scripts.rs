@@ -54,8 +54,14 @@ fn install_sh_fails_with_bad_checksum() {
         .status()
         .expect("run install.sh");
 
-    assert!(!status.success());
-    assert!(!dest.path().join("cass").exists());
+    assert!(
+        !status.success(),
+        "install.sh should fail when checksum does not match"
+    );
+    assert!(
+        !dest.path().join("cass").exists(),
+        "cass binary should not be installed on checksum failure"
+    );
 }
 
 fn find_powershell() -> Option<String> {
@@ -144,6 +150,12 @@ fn install_ps1_fails_with_bad_checksum() {
         .status()
         .expect("run install.ps1");
 
-    assert!(!status.success());
-    assert!(!dest.path().join("cass.exe").exists());
+    assert!(
+        !status.success(),
+        "install.ps1 should fail when checksum does not match"
+    );
+    assert!(
+        !dest.path().join("cass.exe").exists(),
+        "cass.exe should not be installed on checksum failure"
+    );
 }

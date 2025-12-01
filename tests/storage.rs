@@ -169,3 +169,106 @@ fn append_only_updates_existing_conversation() {
         .unwrap();
     assert_eq!(ended_at, 300);
 }
+
+#[test]
+fn large_batch_insert_keeps_fts_in_sync() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("batch.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open");
+
+    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
+
+    // Build a conversation with 200 messages
+    let mut msgs = Vec::new();
+    for idx in 0..200 {
+        msgs.push(msg(idx, 1_000 + idx));
+    }
+    let conv = sample_conv(Some("batch-1"), msgs);
+
+    let outcome = storage
+        .insert_conversation_tree(agent_id, None, &conv)
+        .expect("batch insert");
+    assert_eq!(outcome.inserted_indices.len(), 200);
+
+    let msg_count: i64 = storage
+        .raw()
+        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .unwrap();
+    let fts_count: i64 = storage
+        .raw()
+        .query_row("SELECT COUNT(*) FROM fts_messages", [], |r| r.get(0))
+        .unwrap();
+
+    assert_eq!(msg_count, 200);
+    assert_eq!(fts_count, 200);
+
+    // Spot check a few message rows for correct ordering and timestamps
+    let rows: Vec<(i64, i64)> = storage
+        .raw()
+        .prepare("SELECT idx, created_at FROM messages ORDER BY idx LIMIT 3 OFFSET 197")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap()))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(197, 1_197), (198, 1_198), (199, 1_199)],
+        "tail rows should preserve order and timestamps"
+    );
+}
+
+#[test]
+fn last_scan_ts_roundtrip() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("scan.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open");
+
+    // Initially None
+    assert_eq!(storage.get_last_scan_ts().unwrap(), None);
+
+    storage.set_last_scan_ts(1234).expect("set ts");
+    assert_eq!(storage.get_last_scan_ts().unwrap(), Some(1234));
+
+    // Reopen and ensure persisted
+    drop(storage);
+    let storage2 = SqliteStorage::open(&db_path).expect("reopen");
+    assert_eq!(storage2.get_last_scan_ts().unwrap(), Some(1234));
+}
+
+#[test]
+fn last_scan_ts_overwrite() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("scan_over.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open");
+
+    storage.set_last_scan_ts(10).expect("set ts 10");
+    storage.set_last_scan_ts(20).expect("set ts 20");
+    assert_eq!(storage.get_last_scan_ts().unwrap(), Some(20));
+}
+
+#[test]
+fn unsupported_schema_version_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("schema.db");
+
+    // First open initializes schema to current version
+    let storage = SqliteStorage::open(&db_path).expect("initial open");
+    // Poison the schema_version to an unsupported future value
+    storage
+        .raw()
+        .execute(
+            "UPDATE meta SET value = '999' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+    drop(storage); // Close connection before reopening
+
+    let reopen = SqliteStorage::open(&db_path);
+    assert!(
+        reopen.is_err(),
+        "opening with unsupported schema_version should error"
+    );
+}

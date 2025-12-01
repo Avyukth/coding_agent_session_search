@@ -2,6 +2,10 @@ use coding_agent_search::connectors::cline::ClineConnector;
 use coding_agent_search::connectors::{Connector, ScanContext};
 use std::path::PathBuf;
 
+// ============================================================================
+// Fixture-based tests
+// ============================================================================
+
 #[test]
 fn cline_parses_fixture_task() {
     let fixture_root = PathBuf::from("tests/fixtures/cline");
