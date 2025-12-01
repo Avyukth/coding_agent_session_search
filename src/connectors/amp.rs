@@ -87,6 +87,10 @@ impl Connector for AmpConnector {
                 if !is_amp_log_file(path) {
                     continue;
                 }
+                // Skip files not modified since last scan (incremental indexing)
+                if !crate::connectors::file_modified_since(path, ctx.since_ts) {
+                    continue;
+                }
                 let text = match std::fs::read_to_string(path) {
                     Ok(t) => t,
                     Err(_) => continue,

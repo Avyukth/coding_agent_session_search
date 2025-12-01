@@ -72,6 +72,26 @@ pub trait Connector {
     fn scan(&self, ctx: &ScanContext) -> anyhow::Result<Vec<NormalizedConversation>>;
 }
 
+/// Check if a file was modified since the given timestamp.
+/// Returns true if file should be processed (modified since timestamp or no timestamp given).
+/// Uses file modification time (mtime) for comparison.
+pub fn file_modified_since(path: &std::path::Path, since_ts: Option<i64>) -> bool {
+    match since_ts {
+        None => true, // No timestamp filter, process all files
+        Some(ts) => {
+            // Get file modification time
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .map(|mt| {
+                    mt.duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| (d.as_millis() as i64) >= ts)
+                        .unwrap_or(true) // On time error, process the file
+                })
+                .unwrap_or(true) // On metadata error, process the file
+        }
+    }
+}
+
 /// Parse a timestamp from either i64 milliseconds or ISO-8601 string.
 /// Returns milliseconds since Unix epoch, or None if unparseable.
 ///

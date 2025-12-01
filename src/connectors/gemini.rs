@@ -213,6 +213,10 @@ impl Connector for GeminiConnector {
         let mut convs = Vec::new();
 
         for file in files {
+            // Skip files not modified since last scan (incremental indexing)
+            if !crate::connectors::file_modified_since(&file, ctx.since_ts) {
+                continue;
+            }
             let content = fs::read_to_string(&file)
                 .with_context(|| format!("read session {}", file.display()))?;
 

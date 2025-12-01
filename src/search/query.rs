@@ -3227,6 +3227,104 @@ mod tests {
     }
 
     #[test]
+    fn search_with_fallback_prefers_wildcards_when_they_add_hits() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        // None of these documents contain the exact token "bet",
+        // but they do contain it as a substring ("alphabet").
+        for (i, body) in [
+            "alphabet soup for coders",
+            "mapping the alphabet city blocks",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let conv = NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: None,
+                title: Some(format!("alpha-{i}")),
+                workspace: Some(std::path::PathBuf::from("/ws")),
+                source_path: dir.path().join(format!("alpha-{i}.jsonl")),
+                started_at: Some(100 + i as i64),
+                ended_at: None,
+                metadata: serde_json::json!({}),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "user".into(),
+                    author: None,
+                    created_at: Some(100 + i as i64),
+                    content: body.to_string(),
+                    extra: serde_json::json!({}),
+                    snippets: vec![],
+                }],
+            };
+            index.add_conversation(&conv)?;
+        }
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+
+        let result = client.search_with_fallback("bet", SearchFilters::default(), 10, 0, 2)?;
+
+        assert!(
+            result.wildcard_fallback,
+            "should switch to wildcard fallback when it yields more hits"
+        );
+        assert_eq!(
+            result.hits.len(),
+            2,
+            "fallback should surface all alphabet docs"
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|h| h.match_type == MatchType::ImplicitWildcard)
+        );
+        assert!(result.hits.iter().all(|h| h.content.contains("alphabet")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn search_with_fallback_emits_wildcard_suggestion_on_zero_hits() -> Result<()> {
+        let client = SearchClient {
+            reader: None,
+            sqlite: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: "vtest|schema:none".into(),
+        };
+
+        let result = client.search_with_fallback("ghost", SearchFilters::default(), 5, 0, 3)?;
+
+        assert!(
+            result.hits.is_empty(),
+            "no index/db means no hits should be returned"
+        );
+        assert!(
+            !result.wildcard_fallback,
+            "with zero baseline and fallback hits, we should keep baseline and mark fallback=false"
+        );
+
+        let wildcard = result
+            .suggestions
+            .iter()
+            .find(|s| matches!(s.kind, SuggestionKind::WildcardQuery))
+            .expect("should suggest adding wildcards");
+        assert_eq!(wildcard.suggested_query.as_deref(), Some("*ghost*"));
+
+        Ok(())
+    }
+
+    #[test]
     fn search_with_fallback_skips_empty_query() -> Result<()> {
         let dir = TempDir::new()?;
         let mut index = TantivyIndex::open_or_create(dir.path())?;
@@ -3259,6 +3357,102 @@ mod tests {
         let result = client.search_with_fallback("  ", SearchFilters::default(), 10, 0, 10)?;
 
         assert!(!result.wildcard_fallback);
+        Ok(())
+    }
+
+    #[test]
+    fn search_with_fallback_skips_for_nonzero_offset() -> Result<()> {
+        // Even with zero hits, fallback should not run when paginating (offset > 0)
+        let client = SearchClient {
+            reader: None,
+            sqlite: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: "vtest|schema:none".into(),
+        };
+
+        let result = client.search_with_fallback("ghost", SearchFilters::default(), 5, 10, 3)?;
+
+        assert!(
+            !result.wildcard_fallback,
+            "fallback should not run on paginated searches"
+        );
+        // Suggestions still surface (wildcard suggestion expected)
+        let wildcard = result
+            .suggestions
+            .iter()
+            .find(|s| matches!(s.kind, SuggestionKind::WildcardQuery))
+            .expect("wildcard suggestion present");
+        assert_eq!(wildcard.suggested_query.as_deref(), Some("*ghost*"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn generate_suggestions_limits_and_sets_shortcuts() -> Result<()> {
+        // Build a client without backends; suggestions are purely local heuristics
+        let client = SearchClient {
+            reader: None,
+            sqlite: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: "vtest|schema:none".into(),
+        };
+
+        let mut filters = SearchFilters::default();
+        filters.agents.insert("codex".into()); // triggers remove-agent suggestion
+
+        let result = client.search_with_fallback("claud", filters, 5, 0, 3)?;
+
+        // Should cap at 3 suggestions with shortcuts 1..=3
+        assert_eq!(
+            result.suggestions.len(),
+            3,
+            "should truncate to 3 suggestions"
+        );
+        for (idx, sugg) in result.suggestions.iter().enumerate() {
+            assert_eq!(
+                sugg.shortcut,
+                Some((idx + 1) as u8),
+                "shortcut should match position (1-based)"
+            );
+        }
+
+        // Expect wildcard, remove filter, and spelling fix (claud -> claude)
+        assert!(
+            result
+                .suggestions
+                .iter()
+                .any(|s| matches!(s.kind, SuggestionKind::WildcardQuery)),
+            "should suggest wildcard search"
+        );
+        assert!(
+            result
+                .suggestions
+                .iter()
+                .any(|s| matches!(s.kind, SuggestionKind::RemoveFilter)),
+            "should suggest removing agent filter"
+        );
+        assert!(
+            result
+                .suggestions
+                .iter()
+                .any(|s| matches!(s.kind, SuggestionKind::SpellingFix)),
+            "should suggest spelling fix for nearby agent name"
+        );
+
         Ok(())
     }
 

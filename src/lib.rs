@@ -6,6 +6,7 @@ pub mod model;
 pub mod search;
 pub mod storage;
 pub mod ui;
+pub mod update_check;
 
 use anyhow::Result;
 use chrono::Utc;
@@ -13,7 +14,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use indexer::IndexOptions;
 use reqwest::Client;
 use semver::Version;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -159,6 +160,13 @@ pub enum Commands {
         /// Include extended metadata in robot output (elapsed_ms, wildcard_fallback, cache_stats)
         #[arg(long)]
         robot_meta: bool,
+        /// Select specific fields in JSON output (comma-separated). Use 'minimal' for source_path,line_number,agent
+        /// or 'summary' for source_path,line_number,agent,title,score. Example: --fields source_path,line_number
+        #[arg(long, value_delimiter = ',')]
+        fields: Option<Vec<String>>,
+        /// Truncate content/snippet fields to max N characters (UTF-8 safe, adds '...' and _truncated indicator)
+        #[arg(long)]
+        max_content_length: Option<usize>,
         /// Human-readable display format: table (aligned columns), lines (one-liner), markdown
         #[arg(long, value_enum)]
         display: Option<DisplayFormat>,
@@ -183,6 +191,10 @@ pub enum Commands {
         /// Filter to entries until ISO date
         #[arg(long)]
         until: Option<String>,
+        /// Server-side aggregation by field(s). Comma-separated: agent,workspace,date,match_type
+        /// Returns buckets with counts instead of full results. Use with --limit to get both.
+        #[arg(long, value_delimiter = ',')]
+        aggregate: Option<Vec<String>>,
     },
     /// Show statistics about indexed data
     Stats {
@@ -204,6 +216,30 @@ pub enum Commands {
         /// Include verbose information (file sizes, timestamps)
         #[arg(long, short)]
         verbose: bool,
+    },
+    /// Quick health check for agents: index freshness, db stats, recommended action
+    Status {
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output as JSON (default for robot consumption)
+        #[arg(long)]
+        json: bool,
+        /// Staleness threshold in seconds (default: 1800 = 30 minutes)
+        #[arg(long, default_value_t = 1800)]
+        stale_threshold: u64,
+    },
+    /// Discover available features, versions, and limits for agent introspection
+    Capabilities {
+        /// Output as JSON (default for robot consumption)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Full API schema introspection - commands, arguments, and response schemas
+    Introspect {
+        /// Output as JSON (default for robot consumption)
+        #[arg(long)]
+        json: bool,
     },
     /// View a source file at a specific line (follow up on search results)
     View {
@@ -270,6 +306,79 @@ pub enum DisplayFormat {
     Lines,
     /// Markdown with role headers and code blocks
     Markdown,
+}
+
+/// Aggregation field types for --aggregate flag
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateField {
+    Agent,
+    Workspace,
+    Date,
+    MatchType,
+}
+
+impl AggregateField {
+    /// Parse field name to enum
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "agent" => Some(Self::Agent),
+            "workspace" => Some(Self::Workspace),
+            "date" => Some(Self::Date),
+            "match_type" | "matchtype" => Some(Self::MatchType),
+            _ => None,
+        }
+    }
+
+    /// Get the field name as a string
+    #[allow(dead_code)]
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Workspace => "workspace",
+            Self::Date => "date",
+            Self::MatchType => "match_type",
+        }
+    }
+}
+
+/// A single bucket in an aggregation result
+#[derive(Debug, Clone, Serialize)]
+pub struct AggregationBucket {
+    /// The grouped key value
+    pub key: String,
+    /// Count of items in this bucket
+    pub count: u64,
+}
+
+/// Aggregation result for a single field
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldAggregation {
+    /// Top buckets (limited to 10 by default)
+    pub buckets: Vec<AggregationBucket>,
+    /// Total count of items that didn't fit in top buckets
+    pub other_count: u64,
+}
+
+/// Container for all aggregation results
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Aggregations {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<FieldAggregation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<FieldAggregation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<FieldAggregation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_type: Option<FieldAggregation>,
+}
+
+impl Aggregations {
+    fn is_empty(&self) -> bool {
+        self.agent.is_none()
+            && self.workspace.is_none()
+            && self.date.is_none()
+            && self.match_type.is_none()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -410,8 +519,16 @@ async fn execute_cli(
         ));
     }
 
-    let filter = if cli.quiet {
-        EnvFilter::new("warn")
+    // Auto-quiet in robot mode: suppress INFO logs for clean JSON output
+    // This ensures AI agents get parseable stdout without log noise on stderr
+    let robot_mode = is_robot_mode(&command);
+    let filter = if cli.quiet || robot_mode {
+        // Robot mode implies quiet unless verbose is explicitly requested
+        if cli.verbose {
+            EnvFilter::new("debug")
+        } else {
+            EnvFilter::new("warn")
+        }
     } else if cli.verbose {
         EnvFilter::new("debug")
     } else {
@@ -479,6 +596,7 @@ async fn execute_cli(
         | Commands::Search { .. }
         | Commands::Stats { .. }
         | Commands::Diag { .. }
+        | Commands::Status { .. }
         | Commands::View { .. } => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
@@ -520,6 +638,8 @@ async fn execute_cli(
                     json,
                     robot_format,
                     robot_meta,
+                    fields,
+                    max_content_length,
                     display,
                     data_dir,
                     days,
@@ -528,6 +648,7 @@ async fn execute_cli(
                     week,
                     since,
                     until,
+                    aggregate,
                 } => {
                     run_cli_search(
                         &query,
@@ -538,6 +659,8 @@ async fn execute_cli(
                         &json,
                         robot_format,
                         robot_meta,
+                        fields,
+                        max_content_length,
                         display,
                         &data_dir,
                         cli.db.clone(),
@@ -551,6 +674,7 @@ async fn execute_cli(
                             since.as_deref(),
                             until.as_deref(),
                         ),
+                        aggregate,
                     )?;
                 }
                 Commands::Stats { data_dir, json } => {
@@ -562,6 +686,13 @@ async fn execute_cli(
                     verbose,
                 } => {
                     run_diag(&data_dir, cli.db.clone(), json, verbose)?;
+                }
+                Commands::Status {
+                    data_dir,
+                    json,
+                    stale_threshold,
+                } => {
+                    run_status(&data_dir, cli.db.clone(), json, stale_threshold)?;
                 }
                 Commands::View {
                     path,
@@ -596,6 +727,12 @@ async fn execute_cli(
                     let man = clap_mangen::Man::new(cmd);
                     man.render(&mut std::io::stdout())
                         .map_err(|e| CliError::unknown(format!("failed to render man: {e}")))?;
+                }
+                Commands::Capabilities { json } => {
+                    run_capabilities(json)?;
+                }
+                Commands::Introspect { json } => {
+                    run_introspect(json)?;
                 }
                 _ => {}
             }
@@ -636,11 +773,35 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Search { .. }) => "search".to_string(),
         Some(Commands::Stats { .. }) => "stats".to_string(),
         Some(Commands::Diag { .. }) => "diag".to_string(),
+        Some(Commands::Status { .. }) => "status".to_string(),
         Some(Commands::View { .. }) => "view".to_string(),
         Some(Commands::Completions { .. }) => "completions".to_string(),
         Some(Commands::Man) => "man".to_string(),
+        Some(Commands::Capabilities { .. }) => "capabilities".to_string(),
+        Some(Commands::Introspect { .. }) => "introspect".to_string(),
         Some(Commands::RobotDocs { topic }) => format!("robot-docs:{topic:?}"),
         None => "(default)".to_string(),
+    }
+}
+
+/// Returns true if the command is using robot/JSON output mode.
+/// Used to auto-suppress INFO logs for clean machine-parseable output.
+fn is_robot_mode(command: &Commands) -> bool {
+    match command {
+        Commands::Search {
+            json,
+            robot_format,
+            robot_meta,
+            ..
+        } => *json || robot_format.is_some() || *robot_meta,
+        Commands::Index { json, .. } => *json,
+        Commands::Stats { json, .. } => *json,
+        Commands::Diag { json, .. } => *json,
+        Commands::Status { json, .. } => *json,
+        Commands::View { json, .. } => *json,
+        Commands::Capabilities { json, .. } => *json,
+        Commands::Introspect { json, .. } => *json,
+        _ => false,
     }
 }
 
@@ -701,8 +862,9 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  3. cass view <source_path> -n <line>  # Follow up on search result",
         "",
         "OUTPUT:",
-        "  --robot | --json   Machine-readable JSON output",
-        "  stdout=data only; stderr=diagnostics",
+        "  --robot | --json   Machine-readable JSON output (auto-quiet enabled)",
+        "  stdout=data only; stderr=warnings/errors only (INFO auto-suppressed)",
+        "  Use -v/--verbose with --json to enable INFO logs if needed",
         "",
         "Subcommands: search | stats | view | index | tui | robot-docs <topic>",
         "Exit codes: 0 ok; 2 usage; 3 missing index/db; 9 unknown",
@@ -716,24 +878,34 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
     let lines: Vec<String> = match topic {
         RobotTopic::Commands => vec![
             "commands:".to_string(),
-            "  (global) --quiet / -q  Suppress info logs (warnings+errors only)".to_string(),
+            "  (global) --quiet / -q  Suppress info logs (auto-enabled in robot mode)".to_string(),
+            "  (global) --verbose/-v  Enable debug logs (overrides auto-quiet)".to_string(),
             "  cass search <query> [OPTIONS]".to_string(),
             "    --agent A         Filter by agent (codex, claude_code, gemini, opencode, amp, cline)".to_string(),
             "    --workspace W     Filter by workspace path".to_string(),
             "    --limit N         Max results (default: 10)".to_string(),
             "    --offset N        Pagination offset (default: 0)".to_string(),
             "    --json | --robot  JSON output for automation".to_string(),
+            "    --fields F1,F2    Select specific fields in hits (reduces token usage)".to_string(),
+            "                      Presets: minimal (path,line,agent), summary (+title,score)".to_string(),
+            "                      Fields: score,agent,workspace,source_path,snippet,content,title,created_at,line_number,match_type".to_string(),
+            "    --max-content-length N  Truncate content/snippet/title to N chars (UTF-8 safe, adds '...')".to_string(),
+            "                            Adds *_truncated: true indicator for each truncated field".to_string(),
             "    --today           Filter to today only".to_string(),
             "    --yesterday       Filter to yesterday only".to_string(),
             "    --week            Filter to last 7 days".to_string(),
             "    --days N          Filter to last N days".to_string(),
             "    --since DATE      Filter from date (YYYY-MM-DD)".to_string(),
             "    --until DATE      Filter to date (YYYY-MM-DD)".to_string(),
+            "    --aggregate F1,F2 Server-side aggregation by fields (agent,workspace,date,match_type)".to_string(),
+            "                      Returns buckets with counts. Reduces tokens by ~99% for overview queries".to_string(),
             "  cass stats [--json] [--data-dir DIR]".to_string(),
+            "  cass status [--json] [--stale-threshold N] [--data-dir DIR]".to_string(),
             "  cass diag [--json] [--verbose] [--data-dir DIR]".to_string(),
             "  cass view <path> [-n LINE] [-C CONTEXT] [--json]".to_string(),
             "  cass index [--full] [--watch] [--json] [--data-dir DIR]".to_string(),
             "  cass tui [--once] [--data-dir DIR]".to_string(),
+            "  cass capabilities [--json]".to_string(),
             "  cass robot-docs <topic>".to_string(),
             "  cass --robot-help".to_string(),
         ],
@@ -759,9 +931,11 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  search: {query:str,limit:int,offset:int,count:int,hits:[{score:f64,agent:str,workspace:str,source_path:str,snippet:str,content:str,title:str,created_at:int?,line_number:int?}]}".to_string(),
             "  stats: {conversations:int,messages:int,by_agent:[{agent:str,count:int}],top_workspaces:[{workspace:str,count:int}],date_range:{oldest:str?,newest:str?},db_path:str}".to_string(),
             "  diag: {version:str,platform:{os:str,arch:str},paths:{data_dir:str,db_path:str,index_path:str},database:{exists:bool,size_bytes:int,conversations:int,messages:int},index:{exists:bool,size_bytes:int},connectors:[{name:str,path:str,found:bool}]}".to_string(),
+            "  status: {healthy:bool,index:{exists:bool,last_indexed:str?,age_seconds:int?,is_stale:bool},database:{exists:bool,conversations:int,messages:int},pending:{watch_active:bool,sessions_pending:int},recommended_action:str}".to_string(),
             "  index: {success:bool,elapsed_ms:int,full:bool,force_rebuild:bool,data_dir:str,db_path:str,conversations:int,messages:int}".to_string(),
             "  error: {error:{code:int,kind:str,message:str,hint:str?,retryable:bool}}".to_string(),
             "  trace: {start_ts:str,end_ts:str,duration_ms:u128,cmd:str,args:[str],exit_code:int,error:?}".to_string(),
+            "  capabilities: {crate_version:str,api_version:int,contract_version:str,features:[str],connectors:[str],limits:{max_limit:int,max_content_length:int,max_fields:int,max_agg_buckets:int}}".to_string(),
         ],
         RobotTopic::ExitCodes => vec![
             "exit-codes:".to_string(),
@@ -792,9 +966,22 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass stats --json                        # JSON stats".to_string(),
             "  cass stats                               # Human-readable stats".to_string(),
             "".to_string(),
+            "# Aggregation (overview queries - 99% token reduction)".to_string(),
+            "  cass search \"error\" --json --aggregate agent    # count by agent".to_string(),
+            "  cass search \"*\" --json --aggregate agent,workspace  # multi-field agg".to_string(),
+            "  cass search \"bug\" --json --aggregate date --week  # time distribution".to_string(),
+            "".to_string(),
+            "# Quick health check (ideal for agents)".to_string(),
+            "  cass status --json                       # health check JSON".to_string(),
+            "  cass status --stale-threshold 3600       # custom stale threshold (1hr)".to_string(),
+            "".to_string(),
             "# Diagnostics".to_string(),
             "  cass diag --json                         # JSON diagnostic info".to_string(),
             "  cass diag --verbose                      # Human-readable with sizes".to_string(),
+            "".to_string(),
+            "# Capabilities introspection (for agent self-configuration)".to_string(),
+            "  cass capabilities --json                 # JSON with version, features, limits".to_string(),
+            "  cass capabilities                        # Human-readable summary".to_string(),
             "".to_string(),
             "# Full workflow".to_string(),
             "  cass index --full                        # index all sessions".to_string(),
@@ -927,6 +1114,84 @@ fn parse_datetime_str(s: &str) -> Option<i64> {
     None
 }
 
+/// Compute aggregations from search hits
+fn compute_aggregations(
+    hits: &[crate::search::query::SearchHit],
+    fields: &[AggregateField],
+) -> Aggregations {
+    use std::collections::HashMap;
+
+    const MAX_BUCKETS: usize = 10;
+    let mut aggregations = Aggregations::default();
+
+    for field in fields {
+        let mut counts: HashMap<String, u64> = HashMap::new();
+
+        // Count occurrences based on field type
+        for hit in hits {
+            let key = match field {
+                AggregateField::Agent => hit.agent.clone(),
+                AggregateField::Workspace => hit.workspace.clone(),
+                AggregateField::Date => {
+                    // Group by date (YYYY-MM-DD)
+                    hit.created_at
+                        .and_then(|ts| {
+                            chrono::DateTime::from_timestamp_millis(ts)
+                                .map(|d| d.format("%Y-%m-%d").to_string())
+                        })
+                        .unwrap_or_else(|| "unknown".to_string())
+                }
+                AggregateField::MatchType => format!("{:?}", hit.match_type).to_lowercase(),
+            };
+            *counts.entry(key).or_insert(0) += 1;
+        }
+
+        // Sort by count descending, take top N
+        let mut sorted: Vec<_> = counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let total_count: u64 = sorted.iter().map(|(_, c)| *c).sum();
+        let top_buckets: Vec<AggregationBucket> = sorted
+            .iter()
+            .take(MAX_BUCKETS)
+            .map(|(key, count)| AggregationBucket {
+                key: key.clone(),
+                count: *count,
+            })
+            .collect();
+        let top_sum: u64 = top_buckets.iter().map(|b| b.count).sum();
+        let other_count = total_count.saturating_sub(top_sum);
+
+        let agg = FieldAggregation {
+            buckets: top_buckets,
+            other_count,
+        };
+
+        match field {
+            AggregateField::Agent => aggregations.agent = Some(agg),
+            AggregateField::Workspace => aggregations.workspace = Some(agg),
+            AggregateField::Date => aggregations.date = Some(agg),
+            AggregateField::MatchType => aggregations.match_type = Some(agg),
+        }
+    }
+
+    aggregations
+}
+
+/// Parse aggregate field strings into enum values, warning on unknown fields
+fn parse_aggregate_fields(fields: &[String]) -> Vec<AggregateField> {
+    fields
+        .iter()
+        .filter_map(|f| {
+            let parsed = AggregateField::from_str(f);
+            if parsed.is_none() {
+                warn!(field = %f, "Unknown aggregate field, ignoring. Valid: agent, workspace, date, match_type");
+            }
+            parsed
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
@@ -937,12 +1202,15 @@ fn run_cli_search(
     json: &bool,
     robot_format: Option<RobotFormat>,
     robot_meta: bool,
+    fields: Option<Vec<String>>,
+    max_content_length: Option<usize>,
     display_format: Option<DisplayFormat>,
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
     wrap: WrapConfig,
     _progress: ProgressResolved,
     time_filter: TimeFilter,
+    aggregate: Option<Vec<String>>,
 ) -> CliResult<()> {
     use crate::search::query::{SearchClient, SearchFilters};
     use crate::search::tantivy::index_dir;
@@ -994,10 +1262,32 @@ fn run_cli_search(
     // Priority: robot_format > json flag > display format > default plain
     let effective_robot = robot_format.or(if *json { Some(RobotFormat::Json) } else { None });
 
+    // Parse aggregate fields if provided
+    let agg_fields = aggregate
+        .as_ref()
+        .map(|f| parse_aggregate_fields(f))
+        .unwrap_or_default();
+    let has_aggregation = !agg_fields.is_empty();
+
     // Use search_with_fallback to get full metadata (wildcard_fallback, cache_stats)
     let sparse_threshold = 3; // Threshold for triggering wildcard fallback
+
+    // When aggregating, we need more results for accurate counts
+    // Fetch up to 1000 for aggregation starting at offset 0, then apply offset/limit
+    let (search_limit, search_offset) = if has_aggregation {
+        (1000.max(*limit + *offset), 0)
+    } else {
+        (*limit, *offset)
+    };
+
     let result = client
-        .search_with_fallback(query, filters, *limit, *offset, sparse_threshold)
+        .search_with_fallback(
+            query,
+            filters.clone(),
+            search_limit,
+            search_offset,
+            sparse_threshold,
+        )
         .map_err(|e| CliError {
             code: 9,
             kind: "search",
@@ -1006,21 +1296,59 @@ fn run_cli_search(
             retryable: true,
         })?;
 
+    // Compute aggregations and create display result based on mode
+    let (aggregations, display_result, total_matches) = if has_aggregation {
+        // Compute aggregations from all fetched results
+        let aggs = compute_aggregations(&result.hits, &agg_fields);
+        let total = result.hits.len();
+
+        // Apply offset and limit to get display hits
+        let display_hits: Vec<_> = result
+            .hits
+            .iter()
+            .skip(*offset)
+            .take(*limit)
+            .cloned()
+            .collect();
+
+        let display = crate::search::query::SearchResult {
+            hits: display_hits,
+            wildcard_fallback: result.wildcard_fallback,
+            cache_stats: result.cache_stats,
+            suggestions: result.suggestions.clone(),
+        };
+        (aggs, display, total)
+    } else {
+        // No aggregation - use result as-is
+        let total = result.hits.len();
+        (Aggregations::default(), result, total)
+    };
+
     let elapsed_ms = start_time.elapsed().as_millis() as u64;
 
     if let Some(format) = effective_robot {
         // Robot output mode (JSON)
         output_robot_results(
-            query, *limit, *offset, &result, format, robot_meta, elapsed_ms,
+            query,
+            *limit,
+            *offset,
+            &display_result,
+            format,
+            robot_meta,
+            elapsed_ms,
+            &fields,
+            max_content_length,
+            &aggregations,
+            total_matches,
         )?;
-    } else if result.hits.is_empty() {
+    } else if display_result.hits.is_empty() {
         eprintln!("No results found.");
     } else if let Some(display) = display_format {
         // Human-readable display formats
-        output_display_results(&result.hits, display, wrap)?;
+        output_display_results(&display_result.hits, display, wrap)?;
     } else {
         // Default plain text output
-        for hit in &result.hits {
+        for hit in &display_result.hits {
             println!("----------------------------------------------------------------");
             println!(
                 "Score: {:.2} | Agent: {} | WS: {}",
@@ -1091,7 +1419,112 @@ fn output_display_results(
     Ok(())
 }
 
+/// Expand field presets and return the resolved field list
+fn expand_field_presets(fields: &Option<Vec<String>>) -> Option<Vec<String>> {
+    fields.as_ref().map(|f| {
+        f.iter()
+            .flat_map(|field| match field.as_str() {
+                "minimal" => vec![
+                    "source_path".to_string(),
+                    "line_number".to_string(),
+                    "agent".to_string(),
+                ],
+                "summary" => vec![
+                    "source_path".to_string(),
+                    "line_number".to_string(),
+                    "agent".to_string(),
+                    "title".to_string(),
+                    "score".to_string(),
+                ],
+                "*" | "all" => vec![], // Empty means include all - handled specially
+                other => vec![other.to_string()],
+            })
+            .collect()
+    })
+}
+
+/// Filter a search hit to only include the requested fields
+fn filter_hit_fields(
+    hit: &crate::search::query::SearchHit,
+    fields: &Option<Vec<String>>,
+) -> serde_json::Value {
+    let all_fields = serde_json::to_value(hit).unwrap_or_default();
+
+    match fields {
+        None => all_fields,                                      // No filtering
+        Some(field_list) if field_list.is_empty() => all_fields, // "all" or "*" preset
+        Some(field_list) => {
+            let mut filtered = serde_json::Map::new();
+            let known_fields = [
+                "score",
+                "agent",
+                "workspace",
+                "source_path",
+                "snippet",
+                "content",
+                "title",
+                "created_at",
+                "line_number",
+                "match_type",
+            ];
+
+            for field in field_list {
+                if let Some(value) = all_fields.get(field) {
+                    filtered.insert(field.clone(), value.clone());
+                } else if !known_fields.contains(&field.as_str()) {
+                    // Warn about unknown fields (only once per unknown field)
+                    warn!(unknown_field = %field, "Unknown field in --fields, ignoring");
+                }
+            }
+            serde_json::Value::Object(filtered)
+        }
+    }
+}
+
+/// Truncate a string to max_len characters, UTF-8 safe, with ellipsis
+fn truncate_content(s: &str, max_len: usize) -> (String, bool) {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
+        (s.to_string(), false)
+    } else {
+        // Leave room for "..." (3 chars)
+        let truncate_at = max_len.saturating_sub(3);
+        let truncated: String = s.chars().take(truncate_at).collect();
+        (format!("{}...", truncated), true)
+    }
+}
+
+/// Apply content truncation to a filtered hit JSON object
+fn apply_content_truncation(hit: serde_json::Value, max_len: Option<usize>) -> serde_json::Value {
+    let Some(max_len) = max_len else {
+        return hit; // No truncation requested
+    };
+
+    let serde_json::Value::Object(mut obj) = hit else {
+        return hit;
+    };
+
+    // Fields that should be truncated
+    let truncatable_fields = ["content", "snippet", "title"];
+
+    for field in truncatable_fields {
+        if let Some(serde_json::Value::String(s)) = obj.get(field) {
+            let (truncated, was_truncated) = truncate_content(s, max_len);
+            if was_truncated {
+                obj.insert(field.to_string(), serde_json::Value::String(truncated));
+                obj.insert(
+                    format!("{}_truncated", field),
+                    serde_json::Value::Bool(true),
+                );
+            }
+        }
+    }
+
+    serde_json::Value::Object(obj)
+}
+
 /// Output search results in robot-friendly format
+#[allow(clippy::too_many_arguments)]
 fn output_robot_results(
     query: &str,
     limit: usize,
@@ -1100,7 +1533,29 @@ fn output_robot_results(
     format: RobotFormat,
     include_meta: bool,
     elapsed_ms: u64,
+    fields: &Option<Vec<String>>,
+    max_content_length: Option<usize>,
+    aggregations: &Aggregations,
+    total_matches: usize,
 ) -> CliResult<()> {
+    // Expand presets (minimal, summary, all, *)
+    let resolved_fields = expand_field_presets(fields);
+
+    // Filter hits to requested fields, then apply content truncation
+    let filtered_hits: Vec<serde_json::Value> = result
+        .hits
+        .iter()
+        .map(|hit| filter_hit_fields(hit, &resolved_fields))
+        .map(|hit| apply_content_truncation(hit, max_content_length))
+        .collect();
+
+    // Serialize aggregations if present
+    let agg_json = if !aggregations.is_empty() {
+        Some(serde_json::to_value(aggregations).unwrap_or_default())
+    } else {
+        None
+    };
+
     match format {
         RobotFormat::Json => {
             // Pretty-printed JSON (backward compatible)
@@ -1109,8 +1564,14 @@ fn output_robot_results(
                 "limit": limit,
                 "offset": offset,
                 "count": result.hits.len(),
-                "hits": result.hits,
+                "total_matches": total_matches,
+                "hits": filtered_hits,
             });
+
+            // Add aggregations if present
+            if let (Some(agg), serde_json::Value::Object(map)) = (&agg_json, &mut payload) {
+                map.insert("aggregations".to_string(), agg.clone());
+            }
 
             // Add extended metadata if requested
             if include_meta && let serde_json::Value::Object(ref mut map) = payload {
@@ -1139,13 +1600,14 @@ fn output_robot_results(
         }
         RobotFormat::Jsonl => {
             // JSONL: one object per line, optional _meta header
-            if include_meta {
-                let meta = serde_json::json!({
+            if include_meta || agg_json.is_some() {
+                let mut meta = serde_json::json!({
                     "_meta": {
                         "query": query,
                         "limit": limit,
                         "offset": offset,
                         "count": result.hits.len(),
+                        "total_matches": total_matches,
                         "elapsed_ms": elapsed_ms,
                         "wildcard_fallback": result.wildcard_fallback,
                         "cache_stats": {
@@ -1155,10 +1617,14 @@ fn output_robot_results(
                         }
                     }
                 });
+                // Add aggregations to meta line
+                if let (Some(agg), serde_json::Value::Object(map)) = (&agg_json, &mut meta) {
+                    map.insert("aggregations".to_string(), agg.clone());
+                }
                 println!("{}", serde_json::to_string(&meta).unwrap_or_default());
             }
-            // One hit per line
-            for hit in &result.hits {
+            // One hit per line (with field filtering applied)
+            for hit in &filtered_hits {
                 println!("{}", serde_json::to_string(hit).unwrap_or_default());
             }
         }
@@ -1169,8 +1635,14 @@ fn output_robot_results(
                 "limit": limit,
                 "offset": offset,
                 "count": result.hits.len(),
-                "hits": result.hits,
+                "total_matches": total_matches,
+                "hits": filtered_hits,
             });
+
+            // Add aggregations if present
+            if let (Some(agg), serde_json::Value::Object(map)) = (&agg_json, &mut payload) {
+                map.insert("aggregations".to_string(), agg.clone());
+            }
 
             if include_meta && let serde_json::Value::Object(ref mut map) = payload {
                 map.insert(
@@ -1529,6 +2001,1460 @@ fn truncate_end(s: &str, max_chars: usize) -> String {
         let take = max_chars - 3; // -3 for "..."
         format!("{}...", s.chars().take(take).collect::<String>())
     }
+}
+
+/// Quick health check for agents: index freshness, db stats, recommended action.
+/// Designed to be fast (<100ms) for pre-search checks.
+fn run_status(
+    data_dir_override: &Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    json: bool,
+    stale_threshold: u64,
+) -> CliResult<()> {
+    use rusqlite::Connection;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let index_path = data_dir.join("tantivy_index");
+    let watch_state_path = data_dir.join("watch_state.json");
+
+    // Check if database exists
+    let db_exists = db_path.exists();
+    let index_exists = index_path.exists();
+
+    // Get current timestamp
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Default values if db doesn't exist
+    let mut conversation_count: i64 = 0;
+    let mut message_count: i64 = 0;
+    let mut last_indexed_at: Option<i64> = None;
+
+    if db_exists && let Ok(conn) = Connection::open(&db_path) {
+        // Get counts
+        conversation_count = conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap_or(0);
+        message_count = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        // Get last indexed timestamp from meta table
+        last_indexed_at = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'last_indexed_at'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok());
+    }
+
+    // Calculate index age and staleness
+    let index_age_secs = last_indexed_at.map(|ts| {
+        let ts_secs = ts / 1000; // Convert millis to secs
+        now_secs.saturating_sub(ts_secs as u64)
+    });
+    let is_stale = index_age_secs
+        .map(|age| age > stale_threshold)
+        .unwrap_or(true);
+
+    // Check for pending sessions from watch_state.json
+    let pending_sessions = if watch_state_path.exists() {
+        std::fs::read_to_string(&watch_state_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|v| v.get("pending_count").and_then(|c| c.as_u64()))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Determine overall health
+    let healthy = db_exists && index_exists && !is_stale;
+
+    // Build recommended action
+    let recommended_action = if !db_exists {
+        Some("Run 'cass index --full' to create the database".to_string())
+    } else if !index_exists {
+        Some("Run 'cass index --full' to rebuild the search index".to_string())
+    } else if is_stale || pending_sessions > 0 {
+        let pending_msg = if pending_sessions > 0 {
+            format!(" ({} sessions pending)", pending_sessions)
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "Run 'cass index' to refresh the index{}",
+            pending_msg
+        ))
+    } else {
+        None
+    };
+
+    if json {
+        let payload = serde_json::json!({
+            "healthy": healthy,
+            "index": {
+                "exists": index_exists,
+                "fresh": !is_stale,
+                "last_indexed_at": last_indexed_at.map(|ts| {
+                    chrono::DateTime::from_timestamp_millis(ts)
+                        .map(|d| d.to_rfc3339())
+                }),
+                "age_seconds": index_age_secs,
+                "stale": is_stale,
+                "stale_threshold_seconds": stale_threshold,
+            },
+            "database": {
+                "exists": db_exists,
+                "conversations": conversation_count,
+                "messages": message_count,
+                "path": db_path.display().to_string(),
+            },
+            "pending": {
+                "sessions": pending_sessions,
+            },
+            "recommended_action": recommended_action,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+    } else {
+        // Human-readable output
+        let status_icon = if healthy { "✓" } else { "!" };
+        let status_word = if healthy {
+            "Healthy"
+        } else {
+            "Attention needed"
+        };
+
+        println!("{} CASS Status: {}", status_icon, status_word);
+        println!();
+
+        // Index info
+        println!("Index:");
+        if index_exists {
+            if let Some(age) = index_age_secs {
+                let age_str = if age < 60 {
+                    format!("{} seconds ago", age)
+                } else if age < 3600 {
+                    format!("{} minutes ago", age / 60)
+                } else if age < 86400 {
+                    format!("{} hours ago", age / 3600)
+                } else {
+                    format!("{} days ago", age / 86400)
+                };
+                let stale_indicator = if is_stale { " (stale)" } else { "" };
+                println!("  Last indexed: {}{}", age_str, stale_indicator);
+            } else {
+                println!("  Last indexed: unknown");
+            }
+        } else {
+            println!("  Not found - run 'cass index --full'");
+        }
+
+        // Database info
+        println!();
+        println!("Database:");
+        if db_exists {
+            println!("  Conversations: {}", conversation_count);
+            println!("  Messages: {}", message_count);
+        } else {
+            println!("  Not found");
+        }
+
+        // Pending
+        if pending_sessions > 0 {
+            println!();
+            println!("Pending: {} sessions awaiting indexing", pending_sessions);
+        }
+
+        // Recommended action
+        if let Some(action) = &recommended_action {
+            println!();
+            println!("Recommended: {}", action);
+        }
+    }
+
+    Ok(())
+}
+
+/// Capabilities response for agent introspection.
+/// Provides static information about CLI features, versions, and limits.
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilitiesResponse {
+    /// Semantic version of the crate
+    pub crate_version: String,
+    /// API contract version (bumped on breaking changes)
+    pub api_version: u32,
+    /// Human-readable contract identifier
+    pub contract_version: String,
+    /// List of supported feature flags
+    pub features: Vec<String>,
+    /// List of supported agent connectors
+    pub connectors: Vec<String>,
+    /// System limits
+    pub limits: CapabilitiesLimits,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilitiesLimits {
+    /// Maximum --limit value
+    pub max_limit: usize,
+    /// Maximum --max-content-length value (0 = unlimited)
+    pub max_content_length: usize,
+    /// Maximum fields in --fields selection
+    pub max_fields: usize,
+    /// Maximum aggregation bucket count per field
+    pub max_agg_buckets: usize,
+}
+
+// ============================================================================
+// Introspect command schema structures
+// ============================================================================
+
+/// Full API introspection response
+#[derive(Debug, Clone, Serialize)]
+pub struct IntrospectResponse {
+    /// API version (matches capabilities)
+    pub api_version: u32,
+    /// Contract version (human-visible)
+    pub contract_version: String,
+    /// Global flags (apply to all commands)
+    pub global_flags: Vec<ArgumentSchema>,
+    /// All available commands with arguments
+    pub commands: Vec<CommandSchema>,
+    /// Response schemas for JSON outputs
+    pub response_schemas: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Schema for a single CLI command
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandSchema {
+    /// Command name (e.g., "search", "status")
+    pub name: String,
+    /// Short description
+    pub description: String,
+    /// Arguments and options
+    pub arguments: Vec<ArgumentSchema>,
+    /// Whether this command supports --json output
+    pub has_json_output: bool,
+}
+
+/// Schema for a command argument/option
+#[derive(Debug, Clone, Serialize)]
+pub struct ArgumentSchema {
+    /// Argument name (e.g., "query", "limit", "json")
+    pub name: String,
+    /// Short flag (e.g., 'n' for -n)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short: Option<char>,
+    /// Description
+    pub description: String,
+    /// Type: "flag", "option", "positional"
+    pub arg_type: String,
+    /// Value type: "string", "integer", "path", "boolean", "enum"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_type: Option<String>,
+    /// Whether required
+    pub required: bool,
+    /// Default value if any
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Enum values if value_type is "enum"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enum_values: Option<Vec<String>>,
+    /// Whether option can be repeated
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeatable: Option<bool>,
+}
+
+/// Global flags that apply to all commands
+fn build_global_flag_schemas() -> Vec<ArgumentSchema> {
+    vec![
+        ArgumentSchema {
+            name: "db".to_string(),
+            short: None,
+            description: "Path to the SQLite database (defaults to platform data dir)".to_string(),
+            arg_type: "option".to_string(),
+            value_type: Some("path".to_string()),
+            required: false,
+            default: None,
+            enum_values: None,
+            repeatable: None,
+        },
+        ArgumentSchema {
+            name: "robot-help".to_string(),
+            short: None,
+            description: "Deterministic machine-first help (no TUI)".to_string(),
+            arg_type: "flag".to_string(),
+            value_type: None,
+            required: false,
+            default: None,
+            enum_values: None,
+            repeatable: None,
+        },
+        ArgumentSchema {
+            name: "trace-file".to_string(),
+            short: None,
+            description: "Trace command execution spans to JSONL file".to_string(),
+            arg_type: "option".to_string(),
+            value_type: Some("path".to_string()),
+            required: false,
+            default: None,
+            enum_values: None,
+            repeatable: None,
+        },
+        ArgumentSchema {
+            name: "quiet".to_string(),
+            short: Some('q'),
+            description: "Reduce log noise (warnings and errors only)".to_string(),
+            arg_type: "flag".to_string(),
+            value_type: None,
+            required: false,
+            default: None,
+            enum_values: None,
+            repeatable: None,
+        },
+        ArgumentSchema {
+            name: "verbose".to_string(),
+            short: Some('v'),
+            description: "Increase verbosity (debug information)".to_string(),
+            arg_type: "flag".to_string(),
+            value_type: None,
+            required: false,
+            default: None,
+            enum_values: None,
+            repeatable: None,
+        },
+        ArgumentSchema {
+            name: "color".to_string(),
+            short: None,
+            description: "Color behavior for CLI output".to_string(),
+            arg_type: "option".to_string(),
+            value_type: Some("enum".to_string()),
+            required: false,
+            default: Some("auto".to_string()),
+            enum_values: Some(vec![
+                "auto".to_string(),
+                "never".to_string(),
+                "always".to_string(),
+            ]),
+            repeatable: None,
+        },
+        ArgumentSchema {
+            name: "progress".to_string(),
+            short: None,
+            description: "Progress output style".to_string(),
+            arg_type: "option".to_string(),
+            value_type: Some("enum".to_string()),
+            required: false,
+            default: Some("auto".to_string()),
+            enum_values: Some(vec![
+                "auto".to_string(),
+                "bars".to_string(),
+                "plain".to_string(),
+                "none".to_string(),
+            ]),
+            repeatable: None,
+        },
+        ArgumentSchema {
+            name: "wrap".to_string(),
+            short: None,
+            description: "Wrap informational output to N columns".to_string(),
+            arg_type: "option".to_string(),
+            value_type: Some("integer".to_string()),
+            required: false,
+            default: None,
+            enum_values: None,
+            repeatable: None,
+        },
+        ArgumentSchema {
+            name: "nowrap".to_string(),
+            short: None,
+            description: "Disable wrapping entirely".to_string(),
+            arg_type: "flag".to_string(),
+            value_type: None,
+            required: false,
+            default: None,
+            enum_values: None,
+            repeatable: None,
+        },
+    ]
+}
+
+/// Discover available features, versions, and limits for agent introspection.
+fn run_capabilities(json: bool) -> CliResult<()> {
+    let response = CapabilitiesResponse {
+        crate_version: env!("CARGO_PKG_VERSION").to_string(),
+        api_version: 1,
+        contract_version: "1".to_string(),
+        features: vec![
+            "json_output".to_string(),
+            "jsonl_output".to_string(),
+            "robot_meta".to_string(),
+            "time_filters".to_string(),
+            "field_selection".to_string(),
+            "content_truncation".to_string(),
+            "aggregations".to_string(),
+            "wildcard_fallback".to_string(),
+            "view_command".to_string(),
+            "status_command".to_string(),
+        ],
+        connectors: vec![
+            "codex".to_string(),
+            "claude_code".to_string(),
+            "gemini".to_string(),
+            "opencode".to_string(),
+            "amp".to_string(),
+            "cline".to_string(),
+        ],
+        limits: CapabilitiesLimits {
+            max_limit: 10000,
+            max_content_length: 0, // 0 = unlimited
+            max_fields: 50,
+            max_agg_buckets: 10,
+        },
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response).unwrap_or_default()
+        );
+    } else {
+        // Human-readable output
+        println!("CASS Capabilities");
+        println!("=================");
+        println!();
+        println!(
+            "Version: {} (api v{})",
+            response.crate_version, response.api_version
+        );
+        println!();
+        println!("Features:");
+        for feature in &response.features {
+            println!("  - {}", feature);
+        }
+        println!();
+        println!("Connectors:");
+        for connector in &response.connectors {
+            println!("  - {}", connector);
+        }
+        println!();
+        println!("Limits:");
+        println!("  max_limit: {}", response.limits.max_limit);
+        println!(
+            "  max_content_length: {} (0 = unlimited)",
+            response.limits.max_content_length
+        );
+        println!("  max_fields: {}", response.limits.max_fields);
+        println!("  max_agg_buckets: {}", response.limits.max_agg_buckets);
+    }
+
+    Ok(())
+}
+
+/// Full API schema introspection - commands, arguments, and response schemas.
+fn run_introspect(json: bool) -> CliResult<()> {
+    let global_flags = build_global_flag_schemas();
+    let commands = build_command_schemas();
+    let response_schemas = build_response_schemas();
+
+    let response = IntrospectResponse {
+        api_version: 1,
+        contract_version: CONTRACT_VERSION.to_string(),
+        global_flags,
+        commands,
+        response_schemas,
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response).unwrap_or_default()
+        );
+    } else {
+        // Human-readable output
+        println!("CASS API Introspection");
+        println!("======================");
+        println!();
+        println!("API Version: {}", response.api_version);
+        println!("Contract Version: {}", response.contract_version);
+        println!();
+        println!("Global Flags:");
+        println!("-------------");
+        for flag in &response.global_flags {
+            let required = if flag.required { " (required)" } else { "" };
+            let default = flag
+                .default
+                .as_ref()
+                .map(|d| format!(" [default: {}]", d))
+                .unwrap_or_default();
+            let enum_values = flag
+                .enum_values
+                .as_ref()
+                .map(|vals| format!(" [values: {}]", vals.join(",")))
+                .unwrap_or_default();
+            let short = flag.short.map(|s| format!("-{}, ", s)).unwrap_or_default();
+            let prefix = if flag.arg_type == "positional" {
+                "".to_string()
+            } else {
+                format!("{}--", short)
+            };
+            println!(
+                "  {}{}: {}{}{}{}",
+                prefix, flag.name, flag.description, required, default, enum_values
+            );
+        }
+        println!();
+        println!("Commands:");
+        println!("---------");
+        for cmd in &response.commands {
+            println!();
+            println!("  {} - {}", cmd.name, cmd.description);
+            if cmd.has_json_output {
+                println!("    [supports --json output]");
+            }
+            if !cmd.arguments.is_empty() {
+                println!("    Arguments:");
+                for arg in &cmd.arguments {
+                    let required = if arg.required { " (required)" } else { "" };
+                    let default = arg
+                        .default
+                        .as_ref()
+                        .map(|d| format!(" [default: {}]", d))
+                        .unwrap_or_default();
+                    let short = arg.short.map(|s| format!("-{}, ", s)).unwrap_or_default();
+                    let prefix = if arg.arg_type == "positional" {
+                        "".to_string()
+                    } else {
+                        format!("{}--", short)
+                    };
+                    println!(
+                        "      {}{}: {}{}{}",
+                        prefix, arg.name, arg.description, required, default
+                    );
+                }
+            }
+        }
+        println!();
+        println!(
+            "Response Schemas: {} defined",
+            response.response_schemas.len()
+        );
+        for name in response.response_schemas.keys() {
+            println!("  - {}", name);
+        }
+    }
+
+    Ok(())
+}
+
+/// Build command schemas for all CLI commands
+fn build_command_schemas() -> Vec<CommandSchema> {
+    vec![
+        CommandSchema {
+            name: "search".to_string(),
+            description: "Run a one-off search and print results to stdout".to_string(),
+            has_json_output: true,
+            arguments: vec![
+                ArgumentSchema {
+                    name: "query".to_string(),
+                    short: None,
+                    description: "The query string".to_string(),
+                    arg_type: "positional".to_string(),
+                    value_type: Some("string".to_string()),
+                    required: true,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "agent".to_string(),
+                    short: None,
+                    description: "Filter by agent slug".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("string".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: Some(true),
+                },
+                ArgumentSchema {
+                    name: "workspace".to_string(),
+                    short: None,
+                    description: "Filter by workspace path".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("string".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: Some(true),
+                },
+                ArgumentSchema {
+                    name: "limit".to_string(),
+                    short: None,
+                    description: "Max results".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("integer".to_string()),
+                    required: false,
+                    default: Some("10".to_string()),
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "offset".to_string(),
+                    short: None,
+                    description: "Offset for pagination".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("integer".to_string()),
+                    required: false,
+                    default: Some("0".to_string()),
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "json".to_string(),
+                    short: None,
+                    description: "Output as JSON".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "robot-format".to_string(),
+                    short: None,
+                    description: "Robot output format".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("enum".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: Some(vec![
+                        "json".to_string(),
+                        "jsonl".to_string(),
+                        "compact".to_string(),
+                    ]),
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "robot-meta".to_string(),
+                    short: None,
+                    description: "Include extended metadata in robot output".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "fields".to_string(),
+                    short: None,
+                    description: "Select specific fields in JSON output (comma-separated)"
+                        .to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("string".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "max-content-length".to_string(),
+                    short: None,
+                    description: "Truncate content fields to max N characters".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("integer".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "display".to_string(),
+                    short: None,
+                    description: "Human-readable display format".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("enum".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: Some(vec![
+                        "table".to_string(),
+                        "lines".to_string(),
+                        "markdown".to_string(),
+                    ]),
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "data-dir".to_string(),
+                    short: None,
+                    description: "Override data dir".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("path".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "days".to_string(),
+                    short: None,
+                    description: "Filter to last N days".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("integer".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "today".to_string(),
+                    short: None,
+                    description: "Filter to today only".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "yesterday".to_string(),
+                    short: None,
+                    description: "Filter to yesterday only".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "week".to_string(),
+                    short: None,
+                    description: "Filter to last 7 days".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "since".to_string(),
+                    short: None,
+                    description: "Filter to entries since ISO date".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("string".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "until".to_string(),
+                    short: None,
+                    description: "Filter to entries until ISO date".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("string".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "aggregate".to_string(),
+                    short: None,
+                    description: "Server-side aggregation by field(s)".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("string".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: Some(vec![
+                        "agent".to_string(),
+                        "workspace".to_string(),
+                        "date".to_string(),
+                        "match_type".to_string(),
+                    ]),
+                    repeatable: None,
+                },
+            ],
+        },
+        CommandSchema {
+            name: "status".to_string(),
+            description: "Quick health check for agents: index freshness, db stats".to_string(),
+            has_json_output: true,
+            arguments: vec![
+                ArgumentSchema {
+                    name: "json".to_string(),
+                    short: None,
+                    description: "Output as JSON".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "stale-threshold".to_string(),
+                    short: None,
+                    description: "Staleness threshold in seconds".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("integer".to_string()),
+                    required: false,
+                    default: Some("1800".to_string()),
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "data-dir".to_string(),
+                    short: None,
+                    description: "Override data dir".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("path".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+            ],
+        },
+        CommandSchema {
+            name: "stats".to_string(),
+            description: "Show statistics about indexed data".to_string(),
+            has_json_output: true,
+            arguments: vec![
+                ArgumentSchema {
+                    name: "json".to_string(),
+                    short: None,
+                    description: "Output as JSON".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "data-dir".to_string(),
+                    short: None,
+                    description: "Override data dir".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("path".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+            ],
+        },
+        CommandSchema {
+            name: "index".to_string(),
+            description: "Run indexer".to_string(),
+            has_json_output: true,
+            arguments: vec![
+                ArgumentSchema {
+                    name: "full".to_string(),
+                    short: None,
+                    description: "Perform full rebuild".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "force-rebuild".to_string(),
+                    short: None,
+                    description: "Force Tantivy index rebuild even if schema matches".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "watch".to_string(),
+                    short: None,
+                    description: "Watch for changes and reindex automatically".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "watch-once".to_string(),
+                    short: None,
+                    description: "Trigger a single watch cycle for specific paths".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("path".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: Some(true),
+                },
+                ArgumentSchema {
+                    name: "json".to_string(),
+                    short: None,
+                    description: "Output as JSON".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "data-dir".to_string(),
+                    short: None,
+                    description: "Override data dir".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("path".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+            ],
+        },
+        CommandSchema {
+            name: "view".to_string(),
+            description: "View a source file at a specific line".to_string(),
+            has_json_output: true,
+            arguments: vec![
+                ArgumentSchema {
+                    name: "path".to_string(),
+                    short: None,
+                    description: "Path to the source file".to_string(),
+                    arg_type: "positional".to_string(),
+                    value_type: Some("path".to_string()),
+                    required: true,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "line".to_string(),
+                    short: Some('n'),
+                    description: "Line number to show (1-indexed)".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("integer".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "context".to_string(),
+                    short: Some('C'),
+                    description: "Number of context lines before/after".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("integer".to_string()),
+                    required: false,
+                    default: Some("5".to_string()),
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "json".to_string(),
+                    short: None,
+                    description: "Output as JSON".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+            ],
+        },
+        CommandSchema {
+            name: "capabilities".to_string(),
+            description: "Discover available features, versions, and limits".to_string(),
+            has_json_output: true,
+            arguments: vec![ArgumentSchema {
+                name: "json".to_string(),
+                short: None,
+                description: "Output as JSON".to_string(),
+                arg_type: "flag".to_string(),
+                value_type: None,
+                required: false,
+                default: None,
+                enum_values: None,
+                repeatable: None,
+            }],
+        },
+        CommandSchema {
+            name: "introspect".to_string(),
+            description: "Full API schema introspection".to_string(),
+            has_json_output: true,
+            arguments: vec![ArgumentSchema {
+                name: "json".to_string(),
+                short: None,
+                description: "Output as JSON".to_string(),
+                arg_type: "flag".to_string(),
+                value_type: None,
+                required: false,
+                default: None,
+                enum_values: None,
+                repeatable: None,
+            }],
+        },
+        CommandSchema {
+            name: "diag".to_string(),
+            description: "Output diagnostic information for troubleshooting".to_string(),
+            has_json_output: true,
+            arguments: vec![
+                ArgumentSchema {
+                    name: "json".to_string(),
+                    short: None,
+                    description: "Output as JSON".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "verbose".to_string(),
+                    short: Some('v'),
+                    description: "Include verbose information".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "data-dir".to_string(),
+                    short: None,
+                    description: "Override data dir".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("path".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+            ],
+        },
+        CommandSchema {
+            name: "tui".to_string(),
+            description: "Launch interactive TUI".to_string(),
+            has_json_output: false,
+            arguments: vec![
+                ArgumentSchema {
+                    name: "once".to_string(),
+                    short: None,
+                    description: "Render once and exit (headless-friendly)".to_string(),
+                    arg_type: "flag".to_string(),
+                    value_type: None,
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+                ArgumentSchema {
+                    name: "data-dir".to_string(),
+                    short: None,
+                    description: "Override data dir".to_string(),
+                    arg_type: "option".to_string(),
+                    value_type: Some("path".to_string()),
+                    required: false,
+                    default: None,
+                    enum_values: None,
+                    repeatable: None,
+                },
+            ],
+        },
+        CommandSchema {
+            name: "robot-docs".to_string(),
+            description: "Machine-focused docs for automation agents".to_string(),
+            has_json_output: false,
+            arguments: vec![ArgumentSchema {
+                name: "topic".to_string(),
+                short: None,
+                description: "Topic to print".to_string(),
+                arg_type: "positional".to_string(),
+                value_type: Some("enum".to_string()),
+                required: true,
+                default: None,
+                enum_values: Some(vec![
+                    "commands".to_string(),
+                    "schemas".to_string(),
+                    "examples".to_string(),
+                    "all".to_string(),
+                ]),
+                repeatable: None,
+            }],
+        },
+        CommandSchema {
+            name: "completions".to_string(),
+            description: "Generate shell completions to stdout".to_string(),
+            has_json_output: false,
+            arguments: vec![ArgumentSchema {
+                name: "shell".to_string(),
+                short: None,
+                description: "Shell to generate completions for".to_string(),
+                arg_type: "positional".to_string(),
+                value_type: Some("enum".to_string()),
+                required: true,
+                default: None,
+                enum_values: Some(vec![
+                    "bash".to_string(),
+                    "zsh".to_string(),
+                    "fish".to_string(),
+                    "powershell".to_string(),
+                    "elvish".to_string(),
+                ]),
+                repeatable: None,
+            }],
+        },
+        CommandSchema {
+            name: "man".to_string(),
+            description: "Generate man page to stdout".to_string(),
+            has_json_output: false,
+            arguments: vec![],
+        },
+    ]
+}
+
+/// Build response schemas for commands that support JSON output
+fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Value> {
+    use serde_json::json;
+    let mut schemas = std::collections::HashMap::new();
+
+    schemas.insert(
+        "search".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" },
+                "limit": { "type": "integer" },
+                "offset": { "type": "integer" },
+                "count": { "type": "integer" },
+                "total_matches": { "type": "integer" },
+                "hits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "source_path": { "type": "string" },
+                            "line_number": { "type": ["integer", "null"] },
+                            "agent": { "type": "string" },
+                            "workspace": { "type": ["string", "null"] },
+                            "title": { "type": ["string", "null"] },
+                            "content": { "type": ["string", "null"] },
+                            "snippet": { "type": ["string", "null"] },
+                            "score": { "type": ["number", "null"] },
+                            "created_at": { "type": ["integer", "string", "null"] },
+                            "match_type": { "type": ["string", "null"] }
+                        }
+                    }
+                },
+                "aggregations": {
+                    "type": ["object", "null"],
+                    "additionalProperties": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key": { "type": "string" },
+                                "count": { "type": "integer" }
+                            }
+                        }
+                    }
+                },
+                "_meta": {
+                    "type": "object",
+                    "properties": {
+                        "elapsed_ms": { "type": "integer" },
+                        "wildcard_fallback": { "type": "boolean" },
+                        "cache_stats": {
+                            "type": "object",
+                            "properties": {
+                                "hits": { "type": "integer" },
+                                "misses": { "type": "integer" },
+                                "shortfall": { "type": "integer" }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "status".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "healthy": { "type": "boolean" },
+                "recommended_action": { "type": ["string", "null"] },
+                "index": {
+                    "type": "object",
+                    "properties": {
+                        "exists": { "type": "boolean" },
+                        "fresh": { "type": "boolean" },
+                        "last_indexed_at": { "type": ["string", "null"] },
+                        "age_seconds": { "type": ["integer", "null"] },
+                        "stale": { "type": "boolean" },
+                        "stale_threshold_seconds": { "type": "integer" }
+                    }
+                },
+                "database": {
+                    "type": "object",
+                    "properties": {
+                        "exists": { "type": "boolean" },
+                        "conversations": { "type": "integer" },
+                        "messages": { "type": "integer" },
+                        "path": { "type": "string" }
+                    }
+                },
+                "pending": {
+                    "type": "object",
+                    "properties": {
+                        "sessions": { "type": "integer" }
+                    }
+                }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "capabilities".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "crate_version": { "type": "string" },
+                "api_version": { "type": "integer" },
+                "contract_version": { "type": "string" },
+                "features": { "type": "array", "items": { "type": "string" } },
+                "connectors": { "type": "array", "items": { "type": "string" } },
+                "limits": {
+                    "type": "object",
+                    "properties": {
+                        "max_limit": { "type": "integer" },
+                        "max_content_length": { "type": "integer" },
+                        "max_fields": { "type": "integer" },
+                        "max_agg_buckets": { "type": "integer" }
+                    }
+                }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "introspect".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "api_version": { "type": "integer" },
+                "contract_version": { "type": "string" },
+                "global_flags": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "short": { "type": ["string", "null"] },
+                            "description": { "type": "string" },
+                            "arg_type": { "type": "string" },
+                            "value_type": { "type": ["string", "null"] },
+                            "required": { "type": "boolean" },
+                            "default": { "type": ["string", "null"] },
+                            "enum_values": { "type": ["array", "null"] },
+                            "repeatable": { "type": ["boolean", "null"] }
+                        }
+                    }
+                },
+                "commands": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "description": { "type": "string" },
+                            "has_json_output": { "type": "boolean" },
+                            "arguments": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": { "type": "string" },
+                                        "short": { "type": ["string", "null"] },
+                                        "description": { "type": "string" },
+                                        "arg_type": { "type": "string" },
+                                        "value_type": { "type": ["string", "null"] },
+                                        "required": { "type": "boolean" },
+                                        "default": { "type": ["string", "null"] },
+                                        "enum_values": { "type": ["array", "null"] },
+                                        "repeatable": { "type": ["boolean", "null"] }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "response_schemas": {
+                    "type": "object",
+                    "additionalProperties": { "type": "object" }
+                }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "index".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "success": { "type": "boolean" },
+                "elapsed_ms": { "type": "integer" },
+                "full": { "type": ["boolean", "null"] },
+                "force_rebuild": { "type": ["boolean", "null"] },
+                "data_dir": { "type": ["string", "null"] },
+                "db_path": { "type": ["string", "null"] },
+                "conversations": { "type": ["integer", "null"] },
+                "messages": { "type": ["integer", "null"] },
+                "error": { "type": ["string", "null"] }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "diag".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "version": { "type": "string" },
+                "platform": {
+                    "type": "object",
+                    "properties": {
+                        "os": { "type": "string" },
+                        "arch": { "type": "string" }
+                    }
+                },
+                "paths": {
+                    "type": "object",
+                    "properties": {
+                        "data_dir": { "type": "string" },
+                        "db_path": { "type": "string" },
+                        "index_path": { "type": "string" }
+                    }
+                },
+                "database": {
+                    "type": "object",
+                    "properties": {
+                        "exists": { "type": "boolean" },
+                        "size_bytes": { "type": "integer" },
+                        "conversations": { "type": "integer" },
+                        "messages": { "type": "integer" }
+                    }
+                },
+                "index": {
+                    "type": "object",
+                    "properties": {
+                        "exists": { "type": "boolean" },
+                        "size_bytes": { "type": "integer" }
+                    }
+                },
+                "connectors": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "path": { "type": "string" },
+                            "found": { "type": "boolean" }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "view".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "start_line": { "type": "integer" },
+                "end_line": { "type": "integer" },
+                "highlight_line": { "type": ["integer", "null"] },
+                "lines": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "number": { "type": "integer" },
+                            "content": { "type": "string" },
+                            "highlighted": { "type": "boolean" }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+
+    schemas.insert(
+        "stats".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "conversations": { "type": "integer" },
+                "messages": { "type": "integer" },
+                "by_agent": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agent": { "type": "string" },
+                            "count": { "type": "integer" }
+                        }
+                    }
+                },
+                "top_workspaces": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "workspace": { "type": "string" },
+                            "count": { "type": "integer" }
+                        }
+                    }
+                },
+                "date_range": {
+                    "type": "object",
+                    "properties": {
+                        "oldest": { "type": ["string", "null"] },
+                        "newest": { "type": ["string", "null"] }
+                    }
+                },
+                "db_path": { "type": "string" }
+            }
+        }),
+    );
+
+    schemas
 }
 
 fn run_view(path: &PathBuf, line: Option<usize>, context: usize, json: bool) -> CliResult<()> {

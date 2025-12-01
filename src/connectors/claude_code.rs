@@ -69,6 +69,10 @@ impl Connector for ClaudeCodeConnector {
             if ext != Some("jsonl") && ext != Some("json") && ext != Some("claude") {
                 continue;
             }
+            // Skip files not modified since last scan (incremental indexing)
+            if !crate::connectors::file_modified_since(entry.path(), ctx.since_ts) {
+                continue;
+            }
             file_count += 1;
             if file_count <= 3 {
                 tracing::debug!(path = %entry.path().display(), "claude_code found file");

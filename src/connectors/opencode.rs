@@ -100,6 +100,10 @@ impl Connector for OpenCodeConnector {
         };
 
         for db_path in dbs {
+            // Skip files not modified since last scan (incremental indexing)
+            if !crate::connectors::file_modified_since(&db_path, ctx.since_ts) {
+                continue;
+            }
             let conn = match Connection::open(&db_path) {
                 Ok(c) => c,
                 Err(err) => {

@@ -35,6 +35,7 @@ use crate::ui::components::pills::{self, Pill};
 use crate::ui::components::theme::ThemePalette;
 use crate::ui::components::widgets::search_bar;
 use crate::ui::data::{ConversationView, InputMode, load_conversation, role_style};
+use crate::update_check::{UpdateInfo, open_in_browser, skip_version, spawn_update_check};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetailTab {
@@ -348,6 +349,35 @@ fn flash_progress(flash_until: Option<Instant>, duration_ms: u64) -> f32 {
             }
         }
         None => 1.0, // No flash active
+    }
+}
+
+/// Calculates staggered reveal progress for a specific item index.
+/// Returns 0.0 (invisible) to 1.0 (fully visible).
+/// Items are revealed in sequence with STAGGER_DELAY_MS between each.
+fn item_reveal_progress(
+    anim_start: Option<Instant>,
+    item_idx: usize,
+    stagger_delay_ms: u64,
+    fade_duration_ms: u64,
+    max_animated: usize,
+) -> f32 {
+    match anim_start {
+        Some(start) => {
+            // Items beyond max_animated appear instantly
+            if item_idx >= max_animated {
+                return 1.0;
+            }
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let item_start_ms = item_idx as u64 * stagger_delay_ms;
+            if elapsed_ms < item_start_ms {
+                0.0 // Not yet started
+            } else {
+                let item_elapsed = elapsed_ms - item_start_ms;
+                (item_elapsed as f32 / fade_duration_ms as f32).clamp(0.0, 1.0)
+            }
+        }
+        None => 1.0, // No animation active, fully visible
     }
 }
 
@@ -740,6 +770,69 @@ fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
         v
     };
 
+    // Welcome / Layout section (bead 019)
+    lines.push(Line::from(Span::styled(
+        "Welcome to CASS - Coding Agent Session Search",
+        palette.title(),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from("  Layout:"));
+    lines.push(Line::from(
+        "  ┌─────────────────────────────────────────────────┐",
+    ));
+    lines.push(Line::from(
+        "  │ [Search Bar]         [Filter Chips]    [Status] │",
+    ));
+    lines.push(Line::from(
+        "  ├────────────────┬────────────────────────────────┤",
+    ));
+    lines.push(Line::from(
+        "  │                │                                │",
+    ));
+    lines.push(Line::from(
+        "  │   Results      │       Detail Preview           │",
+    ));
+    lines.push(Line::from(
+        "  │   (Left/↑↓)    │       (Tab to focus)           │",
+    ));
+    lines.push(Line::from(
+        "  │                │                                │",
+    ));
+    lines.push(Line::from(
+        "  ├────────────────┴────────────────────────────────┤",
+    ));
+    lines.push(Line::from(
+        "  │ [Help Strip]                                    │",
+    ));
+    lines.push(Line::from(
+        "  └─────────────────────────────────────────────────┘",
+    ));
+    lines.push(Line::from(""));
+
+    // Data Directories section
+    lines.extend(add_section(
+        "Data Locations",
+        &[
+            "Index & state: ~/.local/share/coding-agent-search/",
+            "  agent_search.db - Full-text search index",
+            "  tui_state.json - Persisted UI preferences",
+            "  update_state.json - Update check state",
+            "Agent histories auto-detected from: Claude, Codex, Gemini, Copilot, Cursor",
+        ],
+    ));
+
+    // Updates section
+    lines.extend(add_section(
+        "Updates",
+        &[
+            "Checks GitHub releases hourly (offline-friendly, no auto-download)",
+            "When available: banner shows at top with U/S/Esc options",
+            "  U - Open release page in browser (Shift+U)",
+            "  S - Skip this version permanently (Shift+S)",
+            "  Esc - Dismiss banner for this session",
+        ],
+    ));
+
     lines.extend(add_section(
         "Search",
         &[
@@ -800,7 +893,7 @@ fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
             "Enter opens detail modal (o=open, c=copy, p=path, s=snip, n=nano, Esc=close)",
             "F8 open hit in $EDITOR; y copy path/content",
             "/ detail-find within messages; n/N cycle matches",
-            "F1 toggle this help; Esc/F10 quit (or back from detail)",
+            "F1/? toggle this help; Esc/F10 quit (or back from detail)",
         ],
     ));
     lines.extend(add_section(
@@ -823,7 +916,10 @@ fn render_help_overlay(frame: &mut Frame, palette: ThemePalette, scroll: u16) {
     let popup_area = centered_rect(70, 70, area);
     let lines = help_lines(palette);
     let block = Block::default()
-        .title(Span::styled("Help / Shortcuts", palette.title()))
+        .title(Span::styled(
+            "Quick Start & Shortcuts (F1 or ? to reopen)",
+            palette.title(),
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette.accent));
 
@@ -2354,6 +2450,24 @@ pub fn run_tui(
     let mut spinner_frame: usize = 0;
     const SPINNER_CHARS: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
 
+    // Staggered reveal animation state (bead 013)
+    // Env flag to disable animations for performance-sensitive terminals
+    let animations_enabled = !std::env::var("CASS_DISABLE_ANIMATIONS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    // When new results arrive, we start a staggered reveal animation
+    let mut reveal_anim_start: Option<Instant> = None;
+    // Animation timing: each item fades in over ITEM_FADE_MS, staggered by STAGGER_DELAY_MS
+    const STAGGER_DELAY_MS: u64 = 30; // Delay between each item starting
+    const ITEM_FADE_MS: u64 = 120; // Duration of each item's fade-in
+    const MAX_ANIMATED_ITEMS: usize = 15; // Only animate first N items to avoid frame drops
+
+    // Update check state (bead 018)
+    // Spawn background thread to check for updates on startup
+    let update_check_rx = spawn_update_check(env!("CARGO_PKG_VERSION").to_string());
+    let mut update_info: Option<UpdateInfo> = None;
+    let mut update_dismissed = false; // Session-only dismissal (not persisted)
+
     let mut detail_tab = DetailTab::Messages;
     let mut theme_dark = true;
     // Show onboarding overlay only on first launch (when has_seen_help is not set).
@@ -2522,7 +2636,7 @@ pub fn run_tui(
                         [
                             Constraint::Length(3), // search bar (includes filter chips)
                             Constraint::Min(0),    // results + detail
-                            Constraint::Length(2), // footer (status + help strip)
+                            Constraint::Length(3), // footer (query display + status + help strip)
                         ]
                         .as_ref(),
                     )
@@ -2918,7 +3032,57 @@ pub fn run_tui(
                                 let mut lines = vec![header, location_line];
                                 lines.extend(snippet_lines);
 
-                                ListItem::new(lines).style(Style::default().bg(stripe_bg))
+                                // Staggered reveal animation (bead 013)
+                                // Calculate fade progress for this item
+                                let reveal_progress = if animations_enabled {
+                                    item_reveal_progress(
+                                        reveal_anim_start,
+                                        hit_idx,
+                                        STAGGER_DELAY_MS,
+                                        ITEM_FADE_MS,
+                                        MAX_ANIMATED_ITEMS,
+                                    )
+                                } else {
+                                    1.0 // Animations disabled, show immediately
+                                };
+
+                                // Apply fade: lerp from bg color (invisible) to final color
+                                let faded_fg = if reveal_progress < 1.0 {
+                                    lerp_color(stripe_bg, theme.fg, reveal_progress)
+                                } else {
+                                    theme.fg
+                                };
+
+                                // Apply faded foreground to all lines
+                                let faded_lines: Vec<Line> = if reveal_progress < 1.0 {
+                                    lines
+                                        .into_iter()
+                                        .map(|line| {
+                                            Line::from(
+                                                line.spans
+                                                    .into_iter()
+                                                    .map(|span| {
+                                                        let base_fg =
+                                                            span.style.fg.unwrap_or(theme.fg);
+                                                        Span::styled(
+                                                            span.content,
+                                                            span.style.fg(lerp_color(
+                                                                stripe_bg,
+                                                                base_fg,
+                                                                reveal_progress,
+                                                            )),
+                                                        )
+                                                    })
+                                                    .collect::<Vec<_>>(),
+                                            )
+                                        })
+                                        .collect()
+                                } else {
+                                    lines
+                                };
+
+                                ListItem::new(faded_lines)
+                                    .style(Style::default().bg(stripe_bg).fg(faded_fg))
                             })
                             .collect();
 
@@ -3437,12 +3601,57 @@ pub fn run_tui(
                 let footer_area = chunks[2];
                 let footer_split = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(1), Constraint::Length(1)].as_ref())
+                    .constraints(
+                        [
+                            Constraint::Length(1), // query display bar
+                            Constraint::Length(1), // status line
+                            Constraint::Length(1), // help strip
+                        ]
+                        .as_ref(),
+                    )
                     .split(footer_area);
+
+                // Query display bar - prominent centered display of active query
+                let query_display = if !last_query.is_empty() {
+                    let query_text = format!(" {} ", last_query);
+                    let query_len = query_text.len() as u16;
+                    let area_width = footer_split[0].width;
+                    let pad_left = area_width.saturating_sub(query_len) / 2;
+                    let pad_right = area_width
+                        .saturating_sub(query_len)
+                        .saturating_sub(pad_left);
+
+                    Line::from(vec![
+                        Span::styled(
+                            " ".repeat(pad_left as usize),
+                            Style::default().bg(palette.surface),
+                        ),
+                        Span::styled(
+                            query_text,
+                            Style::default()
+                                .fg(palette.bg)
+                                .bg(palette.accent)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            " ".repeat(pad_right as usize),
+                            Style::default().bg(palette.surface),
+                        ),
+                    ])
+                } else {
+                    Line::from(Span::styled(
+                        " No active query ",
+                        Style::default()
+                            .fg(palette.hint)
+                            .add_modifier(Modifier::ITALIC),
+                    ))
+                };
+                let query_bar = Paragraph::new(query_display).alignment(Alignment::Center);
+                f.render_widget(query_bar, footer_split[0]);
 
                 let footer_line = footer_parts.join(" | ");
                 let footer = Paragraph::new(footer_line);
-                f.render_widget(footer, footer_split[0]);
+                f.render_widget(footer, footer_split[1]);
 
                 let shortcuts = contextual_shortcuts(
                     palette_state.open,
@@ -3455,14 +3664,65 @@ pub fn run_tui(
                 if help_active {
                     help_strip::draw_help_strip(
                         f,
-                        footer_split[1],
+                        footer_split[2],
                         &shortcuts,
                         palette,
                         help_pinned,
                     );
                 } else {
                     // Clear help line when hidden
-                    f.render_widget(Paragraph::new(""), footer_split[1]);
+                    f.render_widget(Paragraph::new(""), footer_split[2]);
+                }
+
+                // Update available banner (bead 018)
+                // Shows as a single-line banner at the top when update is available
+                if let Some(ref info) = update_info
+                    && info.should_show()
+                    && !update_dismissed
+                {
+                    let banner_area = Rect::new(
+                        f.area().x + 2,
+                        f.area().y,
+                        f.area().width.saturating_sub(4).min(80),
+                        1,
+                    );
+                    let banner_text = Line::from(vec![
+                        Span::styled("📦 ", Style::default()),
+                        Span::styled("Update: ", Style::default().fg(palette.system)),
+                        Span::styled(
+                            format!("v{} → v{}", info.current_version, info.latest_version),
+                            Style::default()
+                                .fg(palette.accent)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" │ ", Style::default().fg(palette.border)),
+                        Span::styled(
+                            "U",
+                            Style::default()
+                                .fg(palette.system)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" open ", Style::default().fg(palette.hint)),
+                        Span::styled(
+                            "S",
+                            Style::default()
+                                .fg(palette.system)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" skip ", Style::default().fg(palette.hint)),
+                        Span::styled(
+                            "Esc",
+                            Style::default()
+                                .fg(palette.system)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" dismiss", Style::default().fg(palette.hint)),
+                    ]);
+                    f.render_widget(ratatui::widgets::Clear, banner_area);
+                    f.render_widget(
+                        Paragraph::new(banner_text).style(Style::default().bg(palette.surface)),
+                        banner_area,
+                    );
                 }
 
                 if show_help {
@@ -3703,6 +3963,43 @@ pub fn run_tui(
             // Global quit override
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 break;
+            }
+
+            // Update banner keybindings (bead 018)
+            // Only active when banner is visible and no modals are open
+            if let Some(ref info) = update_info
+                && info.should_show()
+                && !update_dismissed
+                && !show_help
+                && !show_detail_modal
+                && !show_bulk_modal
+                && !palette_state.open
+            {
+                match key.code {
+                    KeyCode::Char('U') => {
+                        // Open release URL in browser
+                        let _ = open_in_browser(&info.release_url);
+                        status = format!("Opening release page for v{}...", info.latest_version);
+                        continue;
+                    }
+                    KeyCode::Char('S') => {
+                        // Skip this version (persist) - uppercase to avoid conflict with typing
+                        if let Err(e) = skip_version(&info.latest_version) {
+                            status = format!("Failed to skip version: {e}");
+                        } else {
+                            status = format!("Skipped v{} - won't show again", info.latest_version);
+                            update_dismissed = true;
+                        }
+                        continue;
+                    }
+                    KeyCode::Esc if input_mode == InputMode::Query => {
+                        // Dismiss for this session only
+                        update_dismissed = true;
+                        status = "Update banner dismissed".to_string();
+                        continue;
+                    }
+                    _ => {}
+                }
             }
 
             // Command palette handling takes precedence over help/detail.
@@ -3993,7 +4290,7 @@ pub fn run_tui(
             // While help is open, keys scroll the help modal and do not affect panes.
             if show_help {
                 match key.code {
-                    KeyCode::Esc | KeyCode::F(1) => {
+                    KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => {
                         show_help = false;
                         help_scroll = 0;
                     }
@@ -4641,7 +4938,7 @@ pub fn run_tui(
                                     .to_string();
                             }
                         }
-                        KeyCode::F(1) => {
+                        KeyCode::F(1) | KeyCode::Char('?') => {
                             show_help = !show_help;
                             help_scroll = 0;
                         }
@@ -5679,6 +5976,10 @@ pub fn run_tui(
                                     MAX_VISIBLE_PANES,
                                 );
                                 selected.clear();
+                                // Start staggered reveal animation for fallback results (bead 013)
+                                if animations_enabled && !panes.is_empty() {
+                                    reveal_anim_start = Some(Instant::now());
+                                }
                                 let total_hits: usize = panes.iter().map(|p| p.total_count).sum();
                                 if total_hits > 0 {
                                     status = format!(
@@ -5762,6 +6063,10 @@ pub fn run_tui(
                                 );
                                 // Clear multi-selection when results change
                                 selected.clear();
+                                // Start staggered reveal animation for new results (bead 013)
+                                if animations_enabled && !panes.is_empty() {
+                                    reveal_anim_start = Some(Instant::now());
+                                }
                                 // Show a clean, user-friendly status
                                 let total_hits: usize = panes.iter().map(|p| p.total_count).sum();
                                 status = if total_hits == 0 {
@@ -5803,6 +6108,27 @@ pub fn run_tui(
             if dirty_since.is_some() {
                 spinner_frame = spinner_frame.wrapping_add(1);
                 needs_draw = true;
+            }
+            // Handle staggered reveal animation (bead 013)
+            // Keep redrawing while animation is in progress
+            if let Some(start) = reveal_anim_start {
+                let total_anim_ms = (MAX_ANIMATED_ITEMS as u64) * STAGGER_DELAY_MS + ITEM_FADE_MS;
+                if start.elapsed().as_millis() < total_anim_ms as u128 {
+                    needs_draw = true; // Animation still in progress
+                } else {
+                    reveal_anim_start = None; // Animation complete
+                }
+            }
+            // Poll for update check result (bead 018)
+            if update_info.is_none()
+                && let Ok(info) = update_check_rx.try_recv()
+            {
+                if let Some(ref i) = info
+                    && i.should_show()
+                {
+                    needs_draw = true;
+                }
+                update_info = info;
             }
             last_tick = Instant::now();
         }

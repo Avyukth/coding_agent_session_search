@@ -64,6 +64,24 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
         t_index.delete_all()?;
     }
 
+    // Get last scan timestamp for incremental indexing.
+    // If full rebuild or force_rebuild, scan everything (since_ts = None).
+    // Otherwise, only scan files modified since last successful scan.
+    let since_ts = if opts.full || needs_rebuild {
+        None
+    } else {
+        storage.get_last_scan_ts().unwrap_or(None)
+    };
+
+    if since_ts.is_some() {
+        tracing::info!(since_ts = ?since_ts, "incremental_scan: using last_scan_ts");
+    } else {
+        tracing::info!("full_scan: no last_scan_ts or rebuild requested");
+    }
+
+    // Record scan start time before scanning
+    let scan_start_ts = SqliteStorage::now_millis();
+
     let connectors: Vec<(&'static str, Box<dyn Connector>)> = vec![
         ("codex", Box::new(CodexConnector::new())),
         ("cline", Box::new(ClineConnector::new())),
@@ -86,7 +104,7 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
         }
         let ctx = crate::connectors::ScanContext {
             data_root: opts.data_dir.clone(),
-            since_ts: None,
+            since_ts,
         };
         // We scan here. For optimization in non-progress mode, we could stream.
         // But to show accurate "X/Y", we need to collect.
@@ -117,6 +135,13 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
     }
 
     t_index.commit()?;
+
+    // Update last_scan_ts after successful scan and commit
+    storage.set_last_scan_ts(scan_start_ts)?;
+    tracing::info!(
+        scan_start_ts,
+        "updated last_scan_ts for incremental indexing"
+    );
 
     if let Some(p) = &opts.progress {
         p.phase.store(0, Ordering::Relaxed); // Idle

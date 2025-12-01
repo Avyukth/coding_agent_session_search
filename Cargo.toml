@@ -35,7 +35,7 @@ rayon = "*"
 crossbeam-channel = "*"
 parking_lot = "*"
 lru = "*"
-reqwest = { version = "*", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "*", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 ratatui = { version = "*", features = ["crossterm"] }
 crossterm = "*"
 dirs = "*"

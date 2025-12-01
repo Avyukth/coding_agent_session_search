@@ -85,6 +85,11 @@ impl Connector for ClineConnector {
                 continue;
             };
 
+            // Skip files not modified since last scan (incremental indexing)
+            if !crate::connectors::file_modified_since(&file, ctx.since_ts) {
+                continue;
+            }
+
             let data =
                 fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
             let val: Value = serde_json::from_str(&data).unwrap_or(Value::Null);

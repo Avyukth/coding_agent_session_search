@@ -197,7 +197,7 @@ impl SqliteStorage {
     }
 
     pub fn ensure_agent(&self, agent: &Agent) -> Result<i64> {
-        let now = now_millis();
+        let now = Self::now_millis();
         self.conn.execute(
             "INSERT INTO agents(slug, name, version, kind, created_at, updated_at) VALUES(?,?,?,?,?,?)
              ON CONFLICT(slug) DO UPDATE SET name=excluded.name, version=excluded.version, kind=excluded.kind, updated_at=excluded.updated_at",
@@ -438,6 +438,38 @@ impl SqliteStorage {
         )?;
         Ok(())
     }
+
+    /// Get the timestamp of the last successful scan (milliseconds since epoch).
+    /// Returns None if no scan has been recorded yet.
+    pub fn get_last_scan_ts(&self) -> Result<Option<i64>> {
+        let ts: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'last_scan_ts'",
+                [],
+                |row| Ok(row.get::<_, String>(0).ok().and_then(|s| s.parse().ok())),
+            )
+            .optional()?
+            .flatten();
+        Ok(ts)
+    }
+
+    /// Set the timestamp of the last successful scan (milliseconds since epoch).
+    pub fn set_last_scan_ts(&mut self, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('last_scan_ts', ?)",
+            params![ts.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Get current time as milliseconds since epoch.
+    pub fn now_millis() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
 }
 
 fn apply_pragmas(conn: &mut Connection) -> Result<()> {
@@ -635,11 +667,4 @@ fn agent_kind_str(kind: AgentKind) -> String {
         AgentKind::VsCode => "vscode".into(),
         AgentKind::Hybrid => "hybrid".into(),
     }
-}
-
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
