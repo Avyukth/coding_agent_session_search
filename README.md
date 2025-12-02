@@ -46,7 +46,9 @@ install.ps1 -EasyMode -Verify
 ### 🖥️ Rich Terminal UI (TUI)
 - **Three-Pane Layout**: Filter bar (top), scrollable results (left), and syntax-highlighted details (right).
 - **Multi-Line Result Display**: Each result shows location and up to 3 lines of context; alternating stripes improve scanability.
-- **Live Status**: Footer shows real-time indexing progress (e.g., `Indexing 150/2000 (7%)`) and active filters.
+- **Live Status**: Footer shows real-time indexing progress with sparkline visualization (e.g., `Indexing 150/2000 (7%) ▁▂▄▆█`) and active filters.
+- **Multi-Open Queue**: Queue multiple results with `Ctrl+Enter`, then open all in your editor with `Ctrl+O`. Confirmation prompt for large batches (≥12 items).
+- **Find-in-Detail**: Press `/` to search within the detail pane; matches highlighted with `n`/`N` navigation.
 - **Mouse Support**: Click to select results, scroll panes, or clear filters.
 - **Theming**: Adaptive Dark/Light modes with role-colored messages (User/Assistant/System). Toggle border style (`Ctrl+B`) between rounded Unicode and plain ASCII.
 - **Ranking Modes**: Cycle through `recent`/`balanced`/`relevance`/`quality` with `F12`; quality mode penalizes fuzzy matches.
@@ -59,9 +61,9 @@ Ingests history from all major local agents, normalizing them into a unified `Co
 - **Claude Code**: `~/.claude/projects` (Session JSONL)
 - **OpenCode**: `.opencode` directories (SQLite)
 - **Amp**: `~/.local/share/amp` & VS Code storage
-- **Cursor**: `~/Library/Application Support/Cursor/User/workspaceStorage` (Session JSON)
-- **ChatGPT**: `~/Library/Application Support/com.openai.chat` (Encrypted AES-256-GCM)
-- **Aider**: `~/.aider.chat.history.md` and `.aider.chat.history.md` files (Markdown)
+- **Cursor**: `~/Library/Application Support/Cursor/User/` global + workspace storage (SQLite `state.vscdb`)
+- **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
+- **Aider**: `~/.aider.chat.history.md` and per-project `.aider.chat.history.md` files (Markdown)
 
 ---
 
@@ -252,7 +254,12 @@ cass
     - `Ctrl+B`: Toggle rounded/plain borders.
 - **Actions**:
     - `Enter`: Open original log file in `$EDITOR`.
+    - `Ctrl+Enter`: Add current result to queue (multi-open).
+    - `Ctrl+O`: Open all queued results in editor.
+    - `m`: Toggle selection on current item.
+    - `A`: Bulk actions menu (when items selected).
     - `y`: Copy file path or snippet to clipboard.
+    - `/`: Find text within detail pane.
     - `Ctrl+Shift+R`: Trigger manual re-index (refresh search results).
     - `Ctrl+Shift+Del`: Reset TUI state (clear history, filters, layout).
 
@@ -263,37 +270,96 @@ cass
 The `cass` binary supports both interactive use and automation.
 
 ```bash
+# Interactive
 cass [tui] [--data-dir DIR] [--once]
-cass index [--full] [--watch] [--data-dir DIR]
-cass search "query" --robot --limit 5
+
+# Indexing
+cass index [--full] [--watch] [--data-dir DIR] [--idempotency-key KEY]
+
+# Search
+cass search "query" --robot --limit 5 [--timeout 5000] [--explain] [--dry-run]
+cass search "error" --robot --aggregate agent,workspace --fields minimal
+
+# Inspection & Health
+cass status --json                    # Quick health snapshot
+cass health                           # Minimal pre-flight check (<50ms)
+cass capabilities --json              # Feature discovery
+cass introspect --json                # Full API schema
+cass context /path/to/session --json  # Find related sessions
+cass view /path/to/file -n 42 --json  # View source at line
+
+# Utilities
 cass stats --json
+cass completions bash > ~/.bash_completion.d/cass
 ```
 
-- **cass (default)**: Starts TUI + background watcher.
-- **index --full**: Forces a complete rebuild of the DB and Index.
-- **index --watch**: Runs essentially as a daemon, watching for file changes.
-- **search --robot**: Outputs JSON for other tools to consume.
+### Core Commands
+
+| Command | Purpose |
+|---------|---------|
+| `cass` (default) | Start TUI + background watcher |
+| `index --full` | Complete rebuild of DB and search index |
+| `index --watch` | Daemon mode: watch for file changes, reindex automatically |
+| `search --robot` | JSON output for automation pipelines |
+| `status` / `state` | Health snapshot: index freshness, DB stats, recommended action |
+| `health` | Minimal health check (<50ms), exit 0=healthy, 1=unhealthy |
+| `capabilities` | Discover features, versions, limits (for agent introspection) |
+| `introspect` | Full API schema: commands, arguments, response shapes |
+| `context <path>` | Find sessions related by workspace, day, or agent |
+| `view <path> -n N` | View source file at specific line (follow-up on search) |
 
 ## 🤖 AI / Automation Mode
 
-`cass` is designed to be used by *other* AI agents.
+`cass` is designed to be used by *other* AI agents—with first-class support for structured output, introspection, and error recovery.
 
 - **Robot Mode Guide:** see `docs/ROBOT_MODE.md` for quickstarts, schemas, and integration examples.
-- **Self-Documenting**: Run `cass --robot-help` for a machine-optimized guide (Contract v1).
+- **Self-Documenting**: Run `cass --robot-help` for a machine-optimized guide, or `cass introspect --json` for full schema.
+- **Capabilities Discovery**: `cass capabilities --json` returns supported features, connectors, and limits.
 - **Structured Data**: Use `--robot` or `--json` for strictly typed JSON output on stdout.
+- **Fuzzy Command Recovery**: Typos like `cass serach` suggest the correct command (`search`).
 - **Exit Codes**:
     - `0`: Success
-    - `2`: Usage error
+    - `2`: Usage error (with hint)
     - `3`: Missing index (run `cass index --full`)
-    - `9`: Unknown error
+    - `4`: Not found
+    - `5`: Idempotency mismatch
+    - `9`: Unknown error (with retry hint if applicable)
+    - `10`: Timeout exceeded
 - **Traceability**: Use `--trace-file <path>` to log execution spans for debugging.
+
+### Search Flags for Agents
+
+| Flag | Purpose |
+|------|---------|
+| `--robot` / `--json` | JSON output (pretty-printed) |
+| `--robot-format jsonl\|compact` | Streaming or single-line JSON |
+| `--robot-meta` | Include `_meta` block (elapsed_ms, cache stats, index freshness) |
+| `--fields minimal\|summary\|<list>` | Reduce payload size |
+| `--max-content-length N` | Truncate content fields to N chars |
+| `--max-tokens N` | Soft token budget (~4 chars/token) |
+| `--timeout N` | Timeout in milliseconds; returns partial results |
+| `--cursor <token>` | Cursor-based pagination (from `_meta.next_cursor`) |
+| `--request-id ID` | Echoed in response for correlation |
+| `--aggregate agent,workspace,date` | Server-side aggregations |
+| `--explain` | Include query analysis (parsed query, cost estimate) |
+| `--dry-run` | Validate query without executing |
+
+### Index Flags for Agents
+
+| Flag | Purpose |
+|------|---------|
+| `--idempotency-key KEY` | Safe retries: same key + params returns cached result (24h TTL) |
+| `--json` | JSON output with stats |
 
 ### Ready-to-paste blurb for AGENTS.md / CLAUDE.md
 > **cass (Coding Agent Session Search)** — High-performance local search for agent history.
-> - **Discovery**: `cass --robot-help` (prints automation contract).
-> - **Search**: `cass search "query" --robot [--limit N --agent codex]`.
+> - **Discovery**: `cass capabilities --json` or `cass introspect --json`.
+> - **Search**: `cass search "query" --robot --robot-meta --fields minimal`.
+> - **Paginate**: Use `_meta.next_cursor` → `--cursor <value>`.
+> - **Context**: `cass context <path> --json` (related sessions).
 > - **Inspect**: `cass view <source_path> -n <line> --json`.
-> - **Manage**: `cass index --full` (rebuilds index).
+> - **Health**: `cass health` (exit 0=ok, 1=unhealthy).
+> - **Manage**: `cass index --full --idempotency-key <key>`.
 > - **Design**: stdout is data-only JSON; stderr is diagnostics.
 
 ---
@@ -328,11 +394,11 @@ The project ships with a robust installer (`install.sh` / `install.ps1`) designe
 
 - **Data Location**: Defaults to standard platform data directories (e.g., `~/.local/share/coding-agent-search`). Override with `CASS_DATA_DIR` or `--data-dir`.
 
-- **ChatGPT Decryption**: The ChatGPT macOS app stores conversations encrypted with AES-256-GCM. The encryption key is stored in macOS Keychain under an access group restricted to OpenAI-signed apps. To enable decryption, provide the key via:
-  - Environment variable: `CHATGPT_ENCRYPTION_KEY` (base64-encoded 32-byte key)
-  - Key file: `~/.config/cass/chatgpt_key.bin` or `~/.cass/chatgpt_key.bin` (raw 32 bytes)
+- **ChatGPT Support**: The ChatGPT macOS app stores conversations in versioned formats:
+  - **v1** (legacy): Unencrypted JSON in `conversations-{uuid}/` — fully indexed.
+  - **v2/v3**: Encrypted with AES-256-GCM, key stored in macOS Keychain (OpenAI-signed apps only) — detected but skipped.
 
-  Without the key, ChatGPT encrypted conversations (v3 format) are detected but skipped. Unencrypted legacy conversations (v2 format) are always indexed.
+  Encrypted conversations require keychain access which isn't available to third-party apps. Legacy unencrypted conversations are indexed automatically.
 
 - **Logs**: Written to `cass.log` (daily rotating) in the data directory.
 
