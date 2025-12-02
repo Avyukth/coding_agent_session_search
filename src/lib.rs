@@ -766,56 +766,241 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     (normalized, note)
 }
 
-/// Build a friendly parse error with actionable examples.
+/// Build a friendly parse error with actionable, context-aware examples for AI agents.
+///
+/// This function analyzes what the agent was likely trying to do and provides
+/// targeted examples that match their apparent intent.
 fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[String]) -> String {
-    let is_robot = raw.iter().any(|s| s == "--json" || s == "--robot");
+    let is_robot = raw
+        .iter()
+        .any(|s| s == "--json" || s == "--robot" || s == "-robot" || s == "-json");
+
+    // Detect what the agent was probably trying to do
+    let raw_str = raw.join(" ").to_lowercase();
+    let intent = detect_command_intent(&raw_str);
 
     if is_robot {
-        let mut error_obj = serde_json::Map::new();
-        error_obj.insert("code".into(), serde_json::json!(2));
-        error_obj.insert("kind".into(), "usage".into());
-        // Strip ANSI codes if present, though clap::Error::to_string() usually is plain text.
-        // We can't easily strip ANSI here without a crate, but to_string() should be safe.
-        error_obj.insert("message".into(), err.to_string().into());
-
-        error_obj.insert(
-            "hint".into(),
-            "Check command syntax. See examples below or run 'cass --robot-help'.".into(),
-        );
-        error_obj.insert("retryable".into(), serde_json::json!(false));
+        let mut err_map = serde_json::Map::new();
+        err_map.insert("status".into(), "error".into());
+        err_map.insert("error".into(), err.to_string().into());
+        err_map.insert("kind".into(), "argument_parsing".into());
 
         if raw != normalized && normalized.len() > 1 {
-            error_obj.insert(
+            err_map.insert(
                 "normalized_attempt".into(),
                 normalized[1..].join(" ").into(),
             );
         }
 
-        let suggestions = vec![
-            "cass --robot-help",
-            "cass search \"query\" --robot --limit 5",
-            "cass capabilities --json",
-        ];
-        error_obj.insert("examples".into(), serde_json::json!(suggestions));
+        // Context-aware examples based on detected intent
+        let examples = get_contextual_examples(&intent);
+        err_map.insert("examples".into(), serde_json::json!(examples));
 
-        let mut payload = serde_json::Map::new();
-        payload.insert("error".into(), serde_json::Value::Object(error_obj));
+        // Context-aware hints
+        let hints = get_contextual_hints(&intent, &raw_str);
+        err_map.insert("hints".into(), serde_json::json!(hints));
 
-        return serde_json::to_string_pretty(&payload).unwrap_or_else(|_| err.to_string());
+        // Common mistakes for this intent
+        if let Some(common_mistakes) = get_common_mistakes(&intent) {
+            err_map.insert("common_mistakes".into(), serde_json::json!(common_mistakes));
+        }
+
+        // Quick reference for flags
+        err_map.insert(
+            "flag_syntax".into(),
+            serde_json::json!({
+                "correct": ["--limit 5", "--robot", "--json"],
+                "incorrect": ["-limit 5", "limit=5", "--Limit"]
+            }),
+        );
+
+        return serde_json::to_string_pretty(&err_map).unwrap_or_else(|_| err.to_string());
     }
 
+    // Human-readable format
     let mut parts = Vec::new();
     parts.push("Argument parsing failed; command intent unclear.".to_string());
-    parts.push(format!("clap error: {err}"));
+    parts.push(format!("Error: {err}"));
     if raw != normalized && normalized.len() > 1 {
-        parts.push(format!("Normalized attempt: {}", normalized[1..].join(" ")));
+        parts.push(format!(
+            "Attempted normalization: {}",
+            normalized[1..].join(" ")
+        ));
     }
-    parts.push("Examples:".to_string());
-    parts.push("  cass --color=never robot-docs commands".to_string());
-    parts.push("  cass robot-docs schemas".to_string());
-    parts.push("  cass search \"error\" --json --limit 5".to_string());
-    parts.push("  cass capabilities --json".to_string());
+    parts.push(String::new());
+    parts.push(format!(
+        "Based on your command, you may be trying to: {intent}"
+    ));
+    parts.push(String::new());
+    parts.push("Correct examples:".to_string());
+    for ex in get_contextual_examples(&intent) {
+        parts.push(format!("  {ex}"));
+    }
+    parts.push(String::new());
+    parts.push("Quick syntax reference:".to_string());
+    parts.push("  - Long flags use double-dash: --robot, --limit 5".to_string());
+    parts.push("  - Flag values use space or equals: --limit 5 or --limit=5".to_string());
+    parts.push("  - Subcommands come first: cass search \"query\"".to_string());
     parts.join("\n")
+}
+
+/// Detect the likely command intent from the raw argument string.
+fn detect_command_intent(raw_str: &str) -> String {
+    if raw_str.contains("search")
+        || raw_str.contains("find")
+        || raw_str.contains("query")
+        || raw_str.contains("grep")
+    {
+        "search for sessions or messages".to_string()
+    } else if raw_str.contains("doc") || raw_str.contains("help") || raw_str.contains("robot") {
+        "get robot-mode documentation".to_string()
+    } else if raw_str.contains("stats") || raw_str.contains("ls") || raw_str.contains("list") {
+        "view statistics or list sessions".to_string()
+    } else if raw_str.contains("index")
+        || raw_str.contains("rebuild")
+        || raw_str.contains("reindex")
+    {
+        "rebuild or manage the search index".to_string()
+    } else if raw_str.contains("view") || raw_str.contains("show") || raw_str.contains("get") {
+        "view a specific session".to_string()
+    } else if raw_str.contains("cap") || raw_str.contains("introspect") {
+        "discover tool capabilities".to_string()
+    } else if raw_str.contains("diag") || raw_str.contains("debug") || raw_str.contains("check") {
+        "run diagnostics".to_string()
+    } else if raw_str.contains("status") {
+        "check status".to_string()
+    } else if raw_str.contains("health") {
+        "run health check".to_string()
+    } else {
+        "run a cass command".to_string()
+    }
+}
+
+/// Get context-aware examples based on detected intent.
+fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
+    if intent.contains("search") {
+        vec![
+            "cass search \"error handling\" --robot --limit 10",
+            "cass search \"authentication\" --robot --agent claude",
+            "cass search \"database\" --robot --since 2024-01-01",
+            "cass search \"TODO\" --robot --workspace /path/to/project",
+        ]
+    } else if intent.contains("documentation") {
+        vec![
+            "cass robot-docs commands",
+            "cass robot-docs schemas",
+            "cass robot-docs examples",
+            "cass --robot-help",
+        ]
+    } else if intent.contains("statistics") || intent.contains("list") {
+        vec![
+            "cass stats --robot",
+            "cass stats --robot --agent claude",
+            "cass stats --robot --workspace /path",
+            "cass stats --robot --since 2024-01-01",
+        ]
+    } else if intent.contains("index") {
+        vec![
+            "cass index --robot",
+            "cass index --robot --force",
+            "cass index --robot --data-dir /custom/path",
+        ]
+    } else if intent.contains("view") {
+        vec![
+            "cass view <session-id> --robot",
+            "cass view <session-id> --robot --full",
+            "cass view <session-id> --robot --fields content,timestamp",
+        ]
+    } else if intent.contains("capabilities") {
+        vec!["cass capabilities --json", "cass introspect --json"]
+    } else if intent.contains("diagnostics") {
+        vec!["cass diag --robot", "cass diag --robot --verbose"]
+    } else if intent.contains("status") {
+        vec!["cass status --robot", "cass status --robot --watch"]
+    } else if intent.contains("health") {
+        vec!["cass health --json"]
+    } else {
+        vec![
+            "cass --robot-help                    # Get robot-mode documentation",
+            "cass search \"query\" --robot         # Search sessions",
+            "cass capabilities --json             # Discover capabilities",
+            "cass stats --robot                   # View statistics",
+        ]
+    }
+}
+
+/// Get context-aware hints based on detected intent and raw command.
+fn get_contextual_hints(intent: &str, raw_str: &str) -> Vec<String> {
+    let mut hints = Vec::new();
+
+    // Check for common syntax mistakes
+    if raw_str.contains("-robot") && !raw_str.contains("--robot") {
+        hints.push("Use '--robot' (double-dash), not '-robot'".to_string());
+    }
+    if raw_str.contains("-json") && !raw_str.contains("--json") {
+        hints.push("Use '--json' (double-dash), not '-json'".to_string());
+    }
+    // Only flag bare `limit=` without leading dash as problematic
+    if (raw_str.contains(" limit=") || raw_str.starts_with("limit="))
+        && !raw_str.contains("--limit=")
+        && !raw_str.contains("-limit=")
+    {
+        hints.push("Use '--limit 5' or '--limit=5', not 'limit=5'".to_string());
+    }
+    if raw_str.contains("--robot-docs") {
+        hints.push(
+            "'robot-docs' is a subcommand: use 'cass robot-docs' not 'cass --robot-docs'"
+                .to_string(),
+        );
+    }
+
+    // Intent-specific hints
+    if intent.contains("search") && !raw_str.contains("search") {
+        hints.push(
+            "Use the 'search' subcommand explicitly: cass search \"your query\" --robot"
+                .to_string(),
+        );
+    }
+
+    if hints.is_empty() {
+        hints.push(format!("For {intent}, try: cass --robot-help"));
+    }
+
+    hints
+}
+
+/// Get common mistakes for a given intent.
+fn get_common_mistakes(intent: &str) -> Option<serde_json::Value> {
+    let mistakes = if intent.contains("search") {
+        vec![
+            ("cass query=\"foo\" --robot", "cass search \"foo\" --robot"),
+            ("cass -robot find error", "cass search \"error\" --robot"),
+            (
+                "cass search \"query\" limit=5",
+                "cass search \"query\" --limit 5",
+            ),
+        ]
+    } else if intent.contains("documentation") {
+        vec![
+            ("cass --robot-docs", "cass robot-docs"),
+            ("cass --robot-docs=commands", "cass robot-docs commands"),
+            ("cass docs --robot", "cass robot-docs"),
+        ]
+    } else if intent.contains("statistics") {
+        vec![
+            ("cass ls --robot", "cass stats --robot"),
+            ("cass list --robot", "cass stats --robot"),
+        ]
+    } else {
+        return None;
+    };
+
+    Some(serde_json::json!(
+        mistakes
+            .iter()
+            .map(|(wrong, right)| { serde_json::json!({"wrong": wrong, "correct": right}) })
+            .collect::<Vec<_>>()
+    ))
 }
 
 /// Heuristic recovery for command-line errors to help agents.
@@ -1216,7 +1401,6 @@ async fn execute_cli(
         | Commands::Stats { .. }
         | Commands::Diag { .. }
         | Commands::Status { .. }
-        | Commands::Health { .. }
         | Commands::View { .. } => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
@@ -1322,13 +1506,6 @@ async fn execute_cli(
                 } => {
                     run_status(&data_dir, cli.db.clone(), json, stale_threshold)?;
                 }
-                Commands::State {
-                    data_dir,
-                    json,
-                    stale_threshold,
-                } => {
-                    run_status(&data_dir, cli.db.clone(), json, stale_threshold)?;
-                }
                 Commands::View {
                     path,
                     line,
@@ -1378,6 +1555,9 @@ async fn execute_cli(
                 }
                 Commands::Introspect { json } => {
                     run_introspect(json)?;
+                }
+                Commands::Health { data_dir, json } => {
+                    run_health(&data_dir, cli.db.clone(), json)?;
                 }
                 _ => {}
             }
@@ -1547,12 +1727,12 @@ fn is_robot_mode(command: &Commands) -> bool {
         Commands::Stats { json, .. } => *json,
         Commands::Diag { json, .. } => *json,
         Commands::Status { json, .. } => *json,
+        Commands::Health { json, .. } => *json,
         Commands::ApiVersion { json, .. } => *json,
         Commands::State { json, .. } => *json,
         Commands::View { json, .. } => *json,
         Commands::Capabilities { json, .. } => *json,
         Commands::Introspect { json, .. } => *json,
-        Commands::Health { json, .. } => *json,
         _ => false,
     }
 }
@@ -3299,68 +3479,69 @@ fn run_status(
 
 /// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy.
 /// Designed for agent pre-flight checks before complex operations.
-#[allow(dead_code)]
 fn run_health(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
     json: bool,
+    stale_threshold: u64,
 ) -> CliResult<()> {
     use std::time::Instant;
 
     let start = Instant::now();
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let index_base = data_dir.join("index");
+    let state = state_meta_json(&data_dir, &db_path, stale_threshold);
 
-    let mut issues = Vec::new();
+    let index_exists = state
+        .get("index")
+        .and_then(|i| i.get("exists"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let index_fresh = state
+        .get("index")
+        .and_then(|i| i.get("fresh"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let db_exists = state
+        .get("database")
+        .and_then(|d| d.get("exists"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let pending_sessions = state
+        .get("pending")
+        .and_then(|p| p.get("sessions"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
-    // Check database exists
-    let db_exists = db_path.exists();
-    if !db_exists {
-        issues.push("database not found".to_string());
-    }
-
-    // Check database is readable
-    let db_readable = if db_exists {
-        rusqlite::Connection::open(&db_path).is_ok()
-    } else {
-        false
-    };
-    if db_exists && !db_readable {
-        issues.push("database not readable".to_string());
-    }
-
-    // Check index exists (index/<version>/ directory with content)
-    let index_exists = index_base.exists()
-        && index_base.is_dir()
-        && std::fs::read_dir(&index_base)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-    if !index_exists {
-        issues.push("index missing".to_string());
-    }
-
-    let healthy = db_exists && db_readable && index_exists;
+    let healthy = db_exists && index_exists && index_fresh && pending_sessions == 0;
     let latency_ms = start.elapsed().as_millis() as u64;
 
     if json {
-        let mut payload = serde_json::json!({
+        let payload = serde_json::json!({
             "healthy": healthy,
-            "latency_ms": latency_ms
+            "latency_ms": latency_ms,
+            "state": state
         });
-        if !issues.is_empty() {
-            payload["issues"] = serde_json::json!(issues);
-        }
-        println!("{}", serde_json::to_string(&payload).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
     } else if healthy {
         println!("✓ Healthy ({latency_ms}ms)");
     } else {
         println!("✗ Unhealthy ({latency_ms}ms)");
-        for issue in &issues {
-            println!("  - {issue}");
+        if !db_exists {
+            println!("  - database not found");
         }
-        println!();
-        println!("Run 'cass index --full' to fix.");
+        if !index_exists {
+            println!("  - index not found");
+        } else if !index_fresh {
+            println!("  - index stale (older than {}s)", stale_threshold);
+        }
+        if pending_sessions > 0 {
+            println!("  - {pending_sessions} sessions pending reindex");
+        }
+        println!("Run 'cass index --full' or 'cass index --watch' to refresh.");
     }
 
     if healthy {
@@ -3369,8 +3550,8 @@ fn run_health(
         Err(CliError {
             code: 1,
             kind: "health",
-            message: format!("Health check failed: {}", issues.join(", ")),
-            hint: Some("Run 'cass index --full' to create/rebuild the index".to_string()),
+            message: "Health check failed".to_string(),
+            hint: Some("Run 'cass index --full' to rebuild the index/database.".to_string()),
             retryable: true,
         })
     }
@@ -4621,9 +4802,9 @@ pub fn default_db_path() -> PathBuf {
 
 pub fn default_data_dir() -> PathBuf {
     directories::ProjectDirs::from("com", "coding-agent-search", "coding-agent-search")
-        .expect("project dirs available")
-        .data_dir()
-        .to_path_buf()
+        .map(|p| p.data_dir().to_path_buf())
+        .or_else(|| dirs::home_dir().map(|h| h.join(".coding-agent-search")))
+        .unwrap_or_else(|| PathBuf::from("./data"))
 }
 
 const OWNER: &str = "Dicklesworthstone";

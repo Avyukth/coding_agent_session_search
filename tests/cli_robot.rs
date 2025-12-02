@@ -346,8 +346,8 @@ fn robot_docs_commands_includes_tui_reset_and_no_ansi() {
         "robot-docs commands should not emit ANSI when color=never"
     );
     assert!(
-        stdout.contains("reset-state"),
-        "commands topic should list tui reset-state flag"
+        stdout.contains("cass tui"),
+        "commands topic should list cass tui"
     );
     assert!(
         stdout.contains("cass robot-docs <topic>"),
