@@ -76,15 +76,12 @@ impl TantivyIndex {
 
         let meta_path = path.join("schema_hash.json");
         let mut needs_rebuild = true;
-        if meta_path.exists() {
-            if let Ok(meta) = std::fs::read_to_string(&meta_path) {
-                // Parse JSON and check for exact match to avoid false positives from substring matching
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&meta) {
-                    if json.get("schema_hash").and_then(|v| v.as_str()) == Some(SCHEMA_HASH) {
-                        needs_rebuild = false;
-                    }
-                }
-            }
+        if meta_path.exists()
+            && let Ok(meta) = std::fs::read_to_string(&meta_path)
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&meta)
+            && json.get("schema_hash").and_then(|v| v.as_str()) == Some(SCHEMA_HASH)
+        {
+            needs_rebuild = false;
         }
 
         if needs_rebuild {
