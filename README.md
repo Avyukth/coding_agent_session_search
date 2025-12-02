@@ -42,6 +42,7 @@ install.ps1 -EasyMode -Verify
 - **Auto-Fuzzy Fallback**: When exact searches return sparse results, automatically retries with `*term*` wildcards to broaden matches. Visual indicator shows when fallback is active.
 - **Query History Deduplication**: Recent searches deduplicated to show unique queries; navigate with `Up`/`Down` arrows.
 - **Match Quality Ranking**: New ranking mode (cycle with `F12`) that prioritizes exact matches over wildcard/fuzzy results.
+- **Match Highlighting**: Use `--highlight` in robot mode to wrap matching terms with markers (`**bold**` for text, `<mark>` for HTML output).
 
 ### 🖥️ Rich Terminal UI (TUI)
 - **Three-Pane Layout**: Filter bar (top), scrollable results (left), and syntax-highlighted details (right).
@@ -292,6 +293,11 @@ cass introspect --json                # Full API schema
 cass context /path/to/session --json  # Find related sessions
 cass view /path/to/file -n 42 --json  # View source at line
 
+# Session Analysis
+cass export /path/to/session --format markdown -o out.md  # Export conversation
+cass expand /path/to/session -n 42 -C 5 --json            # Context around line
+cass timeline --today --json                               # Activity timeline
+
 # Utilities
 cass stats --json
 cass completions bash > ~/.bash_completion.d/cass
@@ -311,27 +317,218 @@ cass completions bash > ~/.bash_completion.d/cass
 | `introspect` | Full API schema: commands, arguments, response shapes |
 | `context <path>` | Find sessions related by workspace, day, or agent |
 | `view <path> -n N` | View source file at specific line (follow-up on search) |
+| `export <path>` | Export conversation to markdown/HTML/JSON |
+| `expand <path> -n N` | Show messages around a specific line number |
+| `timeline` | Activity timeline with grouping by hour/day |
 
 ## 🤖 AI / Automation Mode
 
-`cass` is designed to be used by *other* AI agents—with first-class support for structured output, introspection, and error recovery.
+`cass` is purpose-built for consumption by AI coding agents—not just as an afterthought, but as a first-class design goal. When you're an AI agent working on a codebase, your own session history and those of other agents become an invaluable knowledge base: solutions to similar problems, context about design decisions, debugging approaches that worked, and institutional memory that would otherwise be lost.
 
-- **Robot Mode Guide:** see `docs/ROBOT_MODE.md` for quickstarts, schemas, and integration examples.
-- **Self-Documenting**: Run `cass --robot-help` for a machine-optimized guide, or `cass introspect --json` for full schema.
-- **Capabilities Discovery**: `cass capabilities --json` returns supported features, connectors, and limits.
-- **Structured Data**: Use `--robot` or `--json` for strictly typed JSON output on stdout.
-- **Fuzzy Command Recovery**: Typos like `cass serach` suggest the correct command (`search`).
-- **Exit Codes**:
-    - `0`: Success
-    - `2`: Usage error (with hint)
-    - `3`: Missing index (run `cass index --full`)
-    - `4`: Not found
-    - `5`: Idempotency mismatch
-    - `9`: Unknown error (with retry hint if applicable)
-    - `10`: Timeout exceeded
-- **Traceability**: Use `--trace-file <path>` to log execution spans for debugging.
+### Why Cross-Agent Search Matters
 
-### Search Flags for Agents
+Imagine you're Claude Code working on a React authentication bug. With `cass`, you can instantly search across:
+- Your own previous sessions where you solved similar auth issues
+- Codex sessions where someone debugged OAuth flows
+- Cursor conversations about token refresh patterns
+- Aider chats about security best practices
+
+This cross-pollination of knowledge across different AI agents is transformative. Each agent has different strengths, different context windows, and encounters different problems. `cass` unifies all this collective intelligence into a single, searchable index.
+
+### Self-Documenting API
+
+`cass` teaches agents how to use it—no external documentation required:
+
+```bash
+# Quick capability check: what features exist?
+cass capabilities --json
+# → {"features": ["json_output", "cursor_pagination", "highlight_matches", ...], "connectors": [...], "limits": {...}}
+
+# Full API schema with argument types, defaults, and response shapes
+cass introspect --json
+
+# Topic-based help optimized for LLM consumption
+cass robot-docs commands    # All commands and flags
+cass robot-docs schemas     # Response JSON schemas
+cass robot-docs examples    # Copy-paste invocations
+cass robot-docs exit-codes  # Error handling guide
+cass robot-docs guide       # Quick-start walkthrough
+```
+
+### Forgiving Syntax (Agent-Friendly Parsing)
+
+AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input to maximize acceptance when intent is clear:
+
+| What you type | What `cass` understands | Correction note |
+|---------------|------------------------|-----------------|
+| `cass serach "error"` | `cass search "error"` | "Did you mean 'search'?" |
+| `cass -robot -limit=5` | `cass --robot --limit=5` | Single-dash long flags normalized |
+| `cass --Robot --LIMIT 5` | `cass --robot --limit 5` | Case normalized |
+| `cass find "auth"` | `cass search "auth"` | `find`/`query`/`q` → `search` |
+| `cass --robot-docs` | `cass robot-docs` | Flag-as-subcommand detected |
+| `cass search --limt 5` | `cass search --limit 5` | Levenshtein distance ≤2 corrected |
+
+The CLI applies multiple normalization layers:
+1. **Typo correction**: Flags within edit distance 2 are auto-corrected
+2. **Case normalization**: `--Robot`, `--LIMIT` → `--robot`, `--limit`
+3. **Single-dash recovery**: `-robot` → `--robot` (common LLM mistake)
+4. **Subcommand aliases**: `find`/`query`/`q` → `search`, `ls`/`list` → `stats`
+5. **Global flag hoisting**: Position-independent flag handling
+
+When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
+
+### Structured Output Formats
+
+Every command supports machine-readable output:
+
+```bash
+# Pretty-printed JSON (default robot mode)
+cass search "error" --robot
+
+# Streaming JSONL: header line with _meta, then one hit per line
+cass search "error" --robot-format jsonl
+
+# Compact single-line JSON (minimal bytes)
+cass search "error" --robot-format compact
+
+# Include performance metadata
+cass search "error" --robot --robot-meta
+# → { "hits": [...], "_meta": { "elapsed_ms": 12, "cache_hit": true, "wildcard_fallback": false, ... } }
+```
+
+**Design principle**: stdout contains only parseable JSON data; all diagnostics, warnings, and progress go to stderr.
+
+### Token Budget Management
+
+LLMs have context limits. `cass` provides multiple levers to control output size:
+
+| Flag | Effect |
+|------|--------|
+| `--fields minimal` | Only `source_path`, `line_number`, `agent` |
+| `--fields summary` | Adds `title`, `score` |
+| `--fields score,title,snippet` | Custom field selection |
+| `--max-content-length 500` | Truncate long fields (UTF-8 safe, adds "...") |
+| `--max-tokens 2000` | Soft budget (~4 chars/token); adjusts truncation dynamically |
+| `--limit 5` | Cap number of results |
+
+Truncated fields include a `*_truncated: true` indicator so agents know when they're seeing partial content.
+
+### Error Handling for Agents
+
+Errors are structured, actionable, and include recovery hints:
+
+```json
+{
+  "error": {
+    "code": 3,
+    "kind": "index_missing",
+    "message": "Search index not found",
+    "hint": "Run 'cass index --full' to build the index",
+    "retryable": false
+  }
+}
+```
+
+**Exit codes** follow a semantic convention:
+| Code | Meaning | Typical action |
+|------|---------|----------------|
+| 0 | Success | Parse stdout |
+| 2 | Usage error | Fix syntax (hint provided) |
+| 3 | Index missing | Run `cass index --full` |
+| 4 | Not found | Try different query/path |
+| 5 | Idempotency mismatch | Retry with new key |
+| 9 | Unknown error | Check `retryable` flag |
+| 10 | Timeout exceeded | Increase `--timeout` or reduce scope |
+
+The `retryable` field tells agents whether a retry might succeed (e.g., transient I/O) vs. guaranteed failure (e.g., invalid path).
+
+### Session Analysis Commands
+
+Beyond search, `cass` provides commands for deep-diving into specific sessions:
+
+```bash
+# Export full conversation to shareable format
+cass export /path/to/session.jsonl --format markdown -o conversation.md
+cass export /path/to/session.jsonl --format html -o conversation.html
+cass export /path/to/session.jsonl --format json --include-tools
+
+# Expand context around a specific line (from search result)
+cass expand /path/to/session.jsonl -n 42 -C 5 --json
+# → Shows 5 messages before and after line 42
+
+# Activity timeline: when were agents active?
+cass timeline --today --json --group-by hour
+cass timeline --since 7d --agent claude --json
+# → Grouped activity counts, useful for understanding work patterns
+```
+
+### Match Highlighting
+
+The `--highlight` flag wraps matching terms for visual/programmatic identification:
+
+```bash
+cass search "authentication error" --robot --highlight
+# In text output: **authentication** and **error** are bold-wrapped
+# In HTML export: <mark>authentication</mark> and <mark>error</mark>
+```
+
+Highlighting is query-aware: quoted phrases like `"auth error"` highlight as a unit; individual terms highlight separately.
+
+### Pagination & Cursors
+
+For large result sets, use cursor-based pagination:
+
+```bash
+# First page
+cass search "TODO" --robot --robot-meta --limit 20
+# → { "hits": [...], "_meta": { "next_cursor": "eyJ..." } }
+
+# Next page
+cass search "TODO" --robot --robot-meta --limit 20 --cursor "eyJ..."
+```
+
+Cursors are opaque tokens encoding the pagination state. They remain valid as long as the index isn't rebuilt.
+
+### Request Correlation
+
+For debugging and logging, attach a request ID:
+
+```bash
+cass search "bug" --robot --request-id "req-12345"
+# → { "hits": [...], "_meta": { "request_id": "req-12345" } }
+```
+
+### Idempotent Operations
+
+For safe retries (e.g., in CI pipelines or flaky networks):
+
+```bash
+cass index --full --idempotency-key "build-$(date +%Y%m%d)"
+# If same key + params were used in last 24h, returns cached result
+```
+
+### Query Analysis
+
+Debug why a search returned unexpected results:
+
+```bash
+cass search "auth*" --robot --explain
+# → Includes parsed query AST, term expansion, cost estimates
+
+cass search "auth error" --robot --dry-run
+# → Validates query syntax without executing
+```
+
+### Traceability
+
+For debugging agent pipelines:
+
+```bash
+cass search "error" --robot --trace-file /tmp/cass-trace.json
+# Appends execution span with timing, exit code, and command details
+```
+
+### Search Flags Reference
 
 | Flag | Purpose |
 |------|---------|
@@ -341,14 +538,15 @@ cass completions bash > ~/.bash_completion.d/cass
 | `--fields minimal\|summary\|<list>` | Reduce payload size |
 | `--max-content-length N` | Truncate content fields to N chars |
 | `--max-tokens N` | Soft token budget (~4 chars/token) |
-| `--timeout N` | Timeout in milliseconds; returns partial results |
+| `--timeout N` | Timeout in milliseconds; returns partial results on expiry |
 | `--cursor <token>` | Cursor-based pagination (from `_meta.next_cursor`) |
 | `--request-id ID` | Echoed in response for correlation |
 | `--aggregate agent,workspace,date` | Server-side aggregations |
 | `--explain` | Include query analysis (parsed query, cost estimate) |
 | `--dry-run` | Validate query without executing |
+| `--highlight` | Wrap matching terms with markers |
 
-### Index Flags for Agents
+### Index Flags Reference
 
 | Flag | Purpose |
 |------|---------|
@@ -356,12 +554,16 @@ cass completions bash > ~/.bash_completion.d/cass
 | `--json` | JSON output with stats |
 
 ### Ready-to-paste blurb for AGENTS.md / CLAUDE.md
+
 > **cass (Coding Agent Session Search)** — High-performance local search for agent history.
 > - **Discovery**: `cass capabilities --json` or `cass introspect --json`.
-> - **Search**: `cass search "query" --robot --robot-meta --fields minimal`.
+> - **Search**: `cass search "query" --robot --robot-meta --fields minimal [--highlight]`.
 > - **Paginate**: Use `_meta.next_cursor` → `--cursor <value>`.
 > - **Context**: `cass context <path> --json` (related sessions).
 > - **Inspect**: `cass view <source_path> -n <line> --json`.
+> - **Expand**: `cass expand <path> -n <line> -C 3 --json` (messages around line).
+> - **Export**: `cass export <path> --format markdown` (full conversation).
+> - **Timeline**: `cass timeline --today --json` (activity overview).
 > - **Health**: `cass health` (exit 0=ok, 1=unhealthy).
 > - **Manage**: `cass index --full --idempotency-key <key>`.
 > - **Design**: stdout is data-only JSON; stderr is diagnostics.

@@ -1976,7 +1976,7 @@ fn highlight_matches(text: &str, query: &str, start_mark: &str, end_mark: &str) 
 
     // Sort terms by length (longest first) to avoid partial matches
     let mut terms: Vec<_> = terms.into_iter().collect();
-    terms.sort_by(|a, b| b.len().cmp(&a.len()));
+    terms.sort_by_key(|s| std::cmp::Reverse(s.len()));
 
     let mut result = text.to_string();
     for term in &terms {
@@ -2604,7 +2604,7 @@ fn run_cli_search(
     // Priority: robot_format > json flag > display format > default plain
     let effective_robot = robot_format
         .or(if *json { Some(RobotFormat::Json) } else { None })
-        .or_else(|| {
+        .or({
             if robot_auto {
                 Some(RobotFormat::Json)
             } else {
@@ -6019,13 +6019,13 @@ fn format_as_markdown(
     md.push_str(title.as_deref().unwrap_or("Conversation Export"));
     md.push('\n');
 
-    if let Some(ts) = start_ts {
-        if let Some(dt) = Utc.timestamp_opt(ts, 0).single() {
-            md.push_str(&format!(
-                "\n*Started: {}*\n",
-                dt.format("%Y-%m-%d %H:%M UTC")
-            ));
-        }
+    if let Some(ts) = start_ts
+        && let Some(dt) = Utc.timestamp_opt(ts, 0).single()
+    {
+        md.push_str(&format!(
+            "\n*Started: {}*\n",
+            dt.format("%Y-%m-%d %H:%M UTC")
+        ));
     }
     md.push_str("\n---\n\n");
 
@@ -6109,11 +6109,11 @@ fn format_as_text(messages: &[serde_json::Value], include_tools: bool) -> String
                 .or_else(|| msg.get("content"));
             if let Some(arr) = content_val.and_then(|c| c.as_array()) {
                 for block in arr {
-                    if let Some(block_type) = block.get("type").and_then(|t| t.as_str()) {
-                        if block_type == "tool_use" {
-                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                            text.push_str(&format!("[Tool: {}]\n", name));
-                        }
+                    if let Some(block_type) = block.get("type").and_then(|t| t.as_str())
+                        && block_type == "tool_use"
+                    {
+                        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                        text.push_str(&format!("[Tool: {}]\n", name));
                     }
                 }
             }
@@ -6352,13 +6352,13 @@ fn extract_text_content(msg: &serde_json::Value) -> String {
         if let Some(arr) = content.as_array() {
             let mut result = String::new();
             for block in arr {
-                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                        if !result.is_empty() {
-                            result.push('\n');
-                        }
-                        result.push_str(text);
+                if block.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && let Some(text) = block.get("text").and_then(|t| t.as_str())
+                {
+                    if !result.is_empty() {
+                        result.push('\n');
                     }
+                    result.push_str(text);
                 }
             }
             if !result.is_empty() {
@@ -6367,25 +6367,25 @@ fn extract_text_content(msg: &serde_json::Value) -> String {
         }
     }
     // Try nested message.content (Claude Code format)
-    if let Some(inner) = msg.get("message") {
-        if let Some(content) = inner.get("content") {
-            if let Some(text) = content.as_str() {
-                return text.to_string();
-            }
-            if let Some(arr) = content.as_array() {
-                let mut result = String::new();
-                for block in arr {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                            if !result.is_empty() {
-                                result.push('\n');
-                            }
-                            result.push_str(text);
-                        }
+    if let Some(inner) = msg.get("message")
+        && let Some(content) = inner.get("content")
+    {
+        if let Some(text) = content.as_str() {
+            return text.to_string();
+        }
+        if let Some(arr) = content.as_array() {
+            let mut result = String::new();
+            for block in arr {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && let Some(text) = block.get("text").and_then(|t| t.as_str())
+                {
+                    if !result.is_empty() {
+                        result.push('\n');
                     }
+                    result.push_str(text);
                 }
-                return result;
             }
+            return result;
         }
     }
     String::new()
@@ -6398,10 +6398,10 @@ fn extract_role(msg: &serde_json::Value) -> String {
         return role.to_string();
     }
     // Try nested message.role (Claude Code format)
-    if let Some(inner) = msg.get("message") {
-        if let Some(role) = inner.get("role").and_then(|r| r.as_str()) {
-            return role.to_string();
-        }
+    if let Some(inner) = msg.get("message")
+        && let Some(role) = inner.get("role").and_then(|r| r.as_str())
+    {
+        return role.to_string();
     }
     // Try type field (Claude Code also uses "type": "user" or "type": "assistant")
     if let Some(type_val) = msg.get("type").and_then(|t| t.as_str()) {
@@ -6415,6 +6415,7 @@ fn extract_role(msg: &serde_json::Value) -> String {
 }
 
 /// Show activity timeline for a time range
+#[allow(clippy::too_many_arguments)]
 fn run_timeline(
     since: Option<&str>,
     until: Option<&str>,
@@ -6519,12 +6520,11 @@ fn run_timeline(
             retryable: false,
         })?;
 
+    #[allow(clippy::type_complexity)]
     let mut sessions: Vec<(i64, String, Option<String>, i64, Option<i64>, String, i64)> =
         Vec::new();
-    for row in rows {
-        if let Ok(r) = row {
-            sessions.push(r);
-        }
+    for r in rows.flatten() {
+        sessions.push(r);
     }
 
     if json {
@@ -6640,11 +6640,11 @@ fn run_timeline(
             };
 
             println!(
-                "     {} {} {:>5} │ {} │ {}",
+                "     {} {} {:>5} │ {:>3} msgs │ {}",
                 dt.format("%H:%M"),
                 agent_icon,
                 duration.as_deref().unwrap_or(""),
-                format!("{:>3} msgs", msg_count),
+                msg_count,
                 title_preview
             );
         }
@@ -6662,12 +6662,11 @@ fn parse_datetime_flexible(s: &str) -> Option<i64> {
         return Some(dt.timestamp());
     }
 
-    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        if let Some(dt) = date.and_hms_opt(0, 0, 0) {
-            if let Some(local) = Local.from_local_datetime(&dt).single() {
-                return Some(local.timestamp());
-            }
-        }
+    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        && let Some(dt) = date.and_hms_opt(0, 0, 0)
+        && let Some(local) = Local.from_local_datetime(&dt).single()
+    {
+        return Some(local.timestamp());
     }
 
     let now = Local::now();
@@ -6688,15 +6687,15 @@ fn parse_datetime_flexible(s: &str) -> Option<i64> {
                 .map(|d| d.timestamp())
         }
         _ => {
-            if let Some(days_str) = s.strip_suffix('d') {
-                if let Ok(days) = days_str.parse::<i64>() {
-                    return Some((now - chrono::Duration::days(days)).timestamp());
-                }
+            if let Some(days_str) = s.strip_suffix('d')
+                && let Ok(days) = days_str.parse::<i64>()
+            {
+                return Some((now - chrono::Duration::days(days)).timestamp());
             }
-            if let Some(hours_str) = s.strip_suffix('h') {
-                if let Ok(hours) = hours_str.parse::<i64>() {
-                    return Some((now - chrono::Duration::hours(hours)).timestamp());
-                }
+            if let Some(hours_str) = s.strip_suffix('h')
+                && let Ok(hours) = hours_str.parse::<i64>()
+            {
+                return Some((now - chrono::Duration::hours(hours)).timestamp());
             }
             None
         }

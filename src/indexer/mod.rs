@@ -129,6 +129,7 @@ pub fn run_index(
 
     // Define connector factories for parallel execution
     // Each tuple: (name, factory_fn) where factory_fn creates a fresh Connector
+    #[allow(clippy::type_complexity)]
     let connector_factories: Vec<(&'static str, fn() -> Box<dyn Connector + Send>)> = vec![
         ("codex", || Box::new(CodexConnector::new())),
         ("cline", || Box::new(ClineConnector::new())),
