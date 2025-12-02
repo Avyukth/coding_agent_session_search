@@ -219,6 +219,7 @@
             "env",
             "paths",
             "schemas",
+            "guide",
             "exit-codes",
             "examples",
             "contracts",
@@ -644,6 +645,38 @@
         }
       ],
       "has_json_output": true
+    },
+    {
+      "name": "health",
+      "description": "Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy. For agent pre-flight checks",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`{\"healthy\": bool, \"latency_ms\": N}`)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "stale-threshold",
+          "description": "Staleness threshold in seconds (default: 300)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false,
+          "default": "300"
+        }
+      ],
+      "has_json_output": true
     }
   ],
   "response_schemas": {
@@ -657,6 +690,240 @@
         },
         "crate_version": {
           "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "status": {
+      "properties": {
+        "_meta": {
+          "properties": {
+            "data_dir": {
+              "type": "string"
+            },
+            "db_path": {
+              "type": "string"
+            },
+            "timestamp": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "database": {
+          "properties": {
+            "conversations": {
+              "type": "integer"
+            },
+            "exists": {
+              "type": "boolean"
+            },
+            "messages": {
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "healthy": {
+          "type": "boolean"
+        },
+        "index": {
+          "properties": {
+            "age_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "exists": {
+              "type": "boolean"
+            },
+            "fresh": {
+              "type": "boolean"
+            },
+            "last_indexed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "stale_threshold_seconds": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "pending": {
+          "properties": {
+            "sessions": {
+              "type": "integer"
+            },
+            "watch_active": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "recommended_action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "health": {
+      "properties": {
+        "healthy": {
+          "type": "boolean"
+        },
+        "latency_ms": {
+          "type": "integer"
+        },
+        "state": {
+          "properties": {
+            "_meta": {
+              "properties": {
+                "data_dir": {
+                  "type": "string"
+                },
+                "db_path": {
+                  "type": "string"
+                },
+                "timestamp": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "database": {
+              "properties": {
+                "conversations": {
+                  "type": "integer"
+                },
+                "exists": {
+                  "type": "boolean"
+                },
+                "messages": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
+            "index": {
+              "properties": {
+                "age_seconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "exists": {
+                  "type": "boolean"
+                },
+                "fresh": {
+                  "type": "boolean"
+                },
+                "last_indexed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "stale": {
+                  "type": "boolean"
+                },
+                "stale_threshold_seconds": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
+            "pending": {
+              "properties": {
+                "sessions": {
+                  "type": "integer"
+                },
+                "watch_active": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "stats": {
+      "properties": {
+        "by_agent": {
+          "items": {
+            "properties": {
+              "agent": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "conversations": {
+          "type": "integer"
+        },
+        "date_range": {
+          "properties": {
+            "newest": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "oldest": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "db_path": {
+          "type": "string"
+        },
+        "messages": {
+          "type": "integer"
+        },
+        "top_workspaces": {
+          "items": {
+            "properties": {
+              "count": {
+                "type": "integer"
+              },
+              "workspace": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -917,6 +1184,94 @@
       },
       "type": "object"
     },
+    "state": {
+      "properties": {
+        "_meta": {
+          "properties": {
+            "data_dir": {
+              "type": "string"
+            },
+            "db_path": {
+              "type": "string"
+            },
+            "timestamp": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "database": {
+          "properties": {
+            "conversations": {
+              "type": "integer"
+            },
+            "exists": {
+              "type": "boolean"
+            },
+            "messages": {
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "healthy": {
+          "type": "boolean"
+        },
+        "index": {
+          "properties": {
+            "age_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "exists": {
+              "type": "boolean"
+            },
+            "fresh": {
+              "type": "boolean"
+            },
+            "last_indexed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "stale_threshold_seconds": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "pending": {
+          "properties": {
+            "sessions": {
+              "type": "integer"
+            },
+            "watch_active": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "recommended_action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "capabilities": {
       "properties": {
         "api_version": {
@@ -956,59 +1311,6 @@
             }
           },
           "type": "object"
-        }
-      },
-      "type": "object"
-    },
-    "index": {
-      "properties": {
-        "conversations": {
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "data_dir": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "db_path": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "elapsed_ms": {
-          "type": "integer"
-        },
-        "error": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "force_rebuild": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "full": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "messages": {
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "success": {
-          "type": "boolean"
         }
       },
       "type": "object"
@@ -1147,94 +1449,6 @@
       },
       "type": "object"
     },
-    "state": {
-      "properties": {
-        "_meta": {
-          "properties": {
-            "data_dir": {
-              "type": "string"
-            },
-            "db_path": {
-              "type": "string"
-            },
-            "timestamp": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        "database": {
-          "properties": {
-            "conversations": {
-              "type": "integer"
-            },
-            "exists": {
-              "type": "boolean"
-            },
-            "messages": {
-              "type": "integer"
-            },
-            "path": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        "healthy": {
-          "type": "boolean"
-        },
-        "index": {
-          "properties": {
-            "age_seconds": {
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "exists": {
-              "type": "boolean"
-            },
-            "fresh": {
-              "type": "boolean"
-            },
-            "last_indexed_at": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "stale": {
-              "type": "boolean"
-            },
-            "stale_threshold_seconds": {
-              "type": "integer"
-            }
-          },
-          "type": "object"
-        },
-        "pending": {
-          "properties": {
-            "sessions": {
-              "type": "integer"
-            },
-            "watch_active": {
-              "type": [
-                "boolean",
-                "null"
-              ]
-            }
-          },
-          "type": "object"
-        },
-        "recommended_action": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
     "view": {
       "properties": {
         "end_line": {
@@ -1272,149 +1486,55 @@
       },
       "type": "object"
     },
-    "stats": {
+    "index": {
       "properties": {
-        "by_agent": {
-          "items": {
-            "properties": {
-              "agent": {
-                "type": "string"
-              },
-              "count": {
-                "type": "integer"
-              }
-            },
-            "type": "object"
-          },
-          "type": "array"
-        },
         "conversations": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
-        "date_range": {
-          "properties": {
-            "newest": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "oldest": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "type": "object"
-        },
-        "db_path": {
-          "type": "string"
-        },
-        "messages": {
-          "type": "integer"
-        },
-        "top_workspaces": {
-          "items": {
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "workspace": {
-                "type": "string"
-              }
-            },
-            "type": "object"
-          },
-          "type": "array"
-        }
-      },
-      "type": "object"
-    },
-    "status": {
-      "properties": {
-        "_meta": {
-          "properties": {
-            "data_dir": {
-              "type": "string"
-            },
-            "db_path": {
-              "type": "string"
-            },
-            "timestamp": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        "database": {
-          "properties": {
-            "conversations": {
-              "type": "integer"
-            },
-            "exists": {
-              "type": "boolean"
-            },
-            "messages": {
-              "type": "integer"
-            },
-            "path": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        "healthy": {
-          "type": "boolean"
-        },
-        "index": {
-          "properties": {
-            "age_seconds": {
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "exists": {
-              "type": "boolean"
-            },
-            "fresh": {
-              "type": "boolean"
-            },
-            "last_indexed_at": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "stale": {
-              "type": "boolean"
-            },
-            "stale_threshold_seconds": {
-              "type": "integer"
-            }
-          },
-          "type": "object"
-        },
-        "pending": {
-          "properties": {
-            "sessions": {
-              "type": "integer"
-            },
-            "watch_active": {
-              "type": [
-                "boolean",
-                "null"
-              ]
-            }
-          },
-          "type": "object"
-        },
-        "recommended_action": {
+        "data_dir": {
           "type": [
             "string",
             "null"
           ]
+        },
+        "db_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "elapsed_ms": {
+          "type": "integer"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "force_rebuild": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "full": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "messages": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "success": {
+          "type": "boolean"
         }
       },
       "type": "object"
