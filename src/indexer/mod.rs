@@ -341,7 +341,7 @@ fn watch_sources<F: Fn(Vec<PathBuf>, bool) + Send + 'static>(
                 continue;
             }
 
-            let remaining = max_wait.checked_sub(elapsed).unwrap();
+            let remaining = max_wait.saturating_sub(elapsed);
             let wait = debounce.min(remaining);
 
             match rx.recv_timeout(wait) {
