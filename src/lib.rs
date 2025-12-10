@@ -2410,7 +2410,7 @@ fn parse_datetime_str(s: &str) -> Option<i64> {
     // Try date only: YYYY-MM-DD
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         return Local
-            .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
+            .from_local_datetime(&date.and_hms_opt(0, 0, 0).expect("midnight is always valid"))
             .single()
             .map(|d| d.timestamp_millis());
     }
@@ -6454,8 +6454,19 @@ fn run_timeline(
 
     let now = Local::now();
     let (start_ts, end_ts) = if today {
-        let start_of_day = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-        let local_start = Local.from_local_datetime(&start_of_day).single().unwrap();
+        let start_of_day = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is always valid");
+        let local_start = Local
+            .from_local_datetime(&start_of_day)
+            .single()
+            .unwrap_or_else(|| {
+                Local
+                    .from_local_datetime(&start_of_day)
+                    .earliest()
+                    .unwrap_or(now)
+            });
         (local_start.timestamp(), now.timestamp())
     } else {
         let start = since
