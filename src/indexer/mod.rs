@@ -28,6 +28,8 @@ pub enum ReindexCommand {
 pub enum IndexerEvent {
     Notify(Vec<PathBuf>),
     Command(ReindexCommand),
+    /// Signal to gracefully shutdown the watcher loop
+    Shutdown,
 }
 
 #[derive(Debug, Default)]
@@ -329,6 +331,10 @@ fn watch_sources<F: Fn(Vec<PathBuf>, bool) + Send + 'static>(
                             callback(vec![], true);
                         }
                     },
+                    IndexerEvent::Shutdown => {
+                        tracing::info!("Received shutdown signal, stopping file watcher");
+                        break;
+                    }
                 },
                 Err(_) => break, // Channel closed
             }
@@ -358,6 +364,14 @@ fn watch_sources<F: Fn(Vec<PathBuf>, bool) + Send + 'static>(
                             first_event = None; // Reset debounce
                         }
                     },
+                    IndexerEvent::Shutdown => {
+                        // Flush any pending work before shutdown
+                        if !pending.is_empty() {
+                            callback(std::mem::take(&mut pending), false);
+                        }
+                        tracing::info!("Received shutdown signal, stopping file watcher");
+                        break;
+                    }
                 },
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     callback(std::mem::take(&mut pending), false);
