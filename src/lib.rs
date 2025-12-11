@@ -5686,20 +5686,22 @@ fn run_index_with_data(
 
     let start = Instant::now();
     // CLI index command doesn't support manual reindex triggering from TUI, so pass None
-    let res = indexer::run_index(opts, None).map_err(|e| {
-        let chain = e
-            .chain()
-            .map(std::string::ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(" | ");
-        CliError {
-            code: 9,
-            kind: "index",
-            message: format!("index failed: {chain}"),
-            hint: None,
-            retryable: true,
-        }
-    });
+    // Wrap with exponential backoff to handle transient failures (e.g., lock contention, I/O errors)
+    let res = backoff::Backoff::fast()
+        .execute(
+            || indexer::run_index(opts.clone(), None),
+            |_| true, // Always retry on error (they're marked retryable)
+        )
+        .map_err(|e| {
+            let chain = format!("{e:#}");
+            CliError {
+                code: 9,
+                kind: "index",
+                message: format!("index failed after retries: {chain}"),
+                hint: Some("Check disk space, file permissions, and database locks".to_string()),
+                retryable: false, // Already retried
+            }
+        });
     let elapsed_ms = start.elapsed().as_millis();
 
     if let Err(err) = &res {
