@@ -1,4 +1,5 @@
 pub mod bookmarks;
+pub mod circuit_breaker;
 pub mod connectors;
 pub mod export;
 pub mod indexer;
