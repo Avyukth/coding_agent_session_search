@@ -13,6 +13,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - name: fmt
         run: cargo fmt -- --check
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny
+        run: cargo deny check
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: check
