@@ -43,8 +43,8 @@ pub mod colors {
     /// Secondary text - body content
     pub const TEXT_SECONDARY: Color = Color::Rgb(169, 177, 214); // #a9b1d6
 
-    /// Muted text - hints, placeholders, timestamps
-    pub const TEXT_MUTED: Color = Color::Rgb(86, 95, 137); // #565f89 (original Tokyo Night)
+    /// Muted text - hints, placeholders, timestamps (WCAG AA compliant)
+    pub const TEXT_MUTED: Color = Color::Rgb(107, 115, 148); // #6b7394 (brightened for ~4.5:1 contrast)
 
     /// Disabled/inactive text
     pub const TEXT_DISABLED: Color = Color::Rgb(68, 75, 106); // #444b6a
