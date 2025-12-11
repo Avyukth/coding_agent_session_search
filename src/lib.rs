@@ -1,3 +1,4 @@
+pub mod backoff;
 pub mod bookmarks;
 pub mod circuit_breaker;
 pub mod connectors;
