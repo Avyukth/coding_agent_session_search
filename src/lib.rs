@@ -29,6 +29,11 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 const CONTRACT_VERSION: &str = "1";
 const DEFAULT_STALE_THRESHOLD_SECS: u64 = 1800;
 
+/// Circuit breaker for HTTP update checks.
+/// Opens after 3 consecutive failures, resets after 30 seconds.
+static UPDATE_CHECK_CIRCUIT: once_cell::sync::Lazy<circuit_breaker::CircuitBreaker> =
+    once_cell::sync::Lazy::new(circuit_breaker::CircuitBreaker::default_http);
+
 fn read_watch_once_paths_env() -> Option<Vec<std::path::PathBuf>> {
     std::env::var("CASS_TEST_WATCH_PATHS")
         .ok()
@@ -5842,12 +5847,40 @@ async fn maybe_prompt_for_update(once: bool) -> Result<()> {
 }
 
 async fn latest_release_version(client: &Client) -> Option<(String, Version)> {
-    let url = format!("https://api.github.com/repos/{OWNER}/{REPO}/releases/latest");
-    let resp = client.get(url).send().await.ok()?;
-    if !resp.status().is_success() {
+    // Skip if circuit breaker is open (too many recent failures)
+    if !UPDATE_CHECK_CIRCUIT.is_closed() {
+        tracing::debug!("Skipping update check: circuit breaker open");
         return None;
     }
-    let info: ReleaseInfo = resp.json().await.ok()?;
+
+    let url = format!("https://api.github.com/repos/{OWNER}/{REPO}/releases/latest");
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            UPDATE_CHECK_CIRCUIT.record_failure();
+            tracing::debug!(error = %e, "Update check failed: request error");
+            return None;
+        }
+    };
+
+    if !resp.status().is_success() {
+        UPDATE_CHECK_CIRCUIT.record_failure();
+        tracing::debug!(status = %resp.status(), "Update check failed: non-success status");
+        return None;
+    }
+
+    let info: ReleaseInfo = match resp.json().await {
+        Ok(i) => i,
+        Err(e) => {
+            UPDATE_CHECK_CIRCUIT.record_failure();
+            tracing::debug!(error = %e, "Update check failed: JSON parse error");
+            return None;
+        }
+    };
+
+    // Success - record it to keep circuit closed
+    UPDATE_CHECK_CIRCUIT.record_success();
+
     let tag = info.tag_name;
     let version_str = tag.trim_start_matches('v');
     let version = Version::parse(version_str).ok()?;
