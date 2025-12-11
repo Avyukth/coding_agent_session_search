@@ -1,0 +1,17 @@
+# Clippy lint configuration for coding-agent-search
+# https://doc.rust-lang.org/clippy/lint_configuration.html
+
+# Maximum cognitive complexity before clippy::cognitive_complexity fires
+cognitive-complexity-threshold = 15
+
+# Prevent panic-inducing methods in production code
+# Note: These trigger warnings - test code uses #[allow] where needed
+disallowed-methods = [
+    { path = "core::option::Option::unwrap", reason = "Use expect() with message, unwrap_or(), or ? operator" },
+    { path = "core::option::Option::expect", reason = "Prefer unwrap_or(), unwrap_or_else(), or ? for production code" },
+    { path = "core::result::Result::unwrap", reason = "Use expect() with message, unwrap_or(), or ? operator" },
+    { path = "core::result::Result::expect", reason = "Prefer unwrap_or(), unwrap_or_else(), or ? for production code" },
+]
+
+# MSRV for feature detection
+msrv = "1.75.0"
