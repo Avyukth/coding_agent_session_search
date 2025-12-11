@@ -5531,6 +5531,16 @@ fn spawn_background_indexer(
 ) -> Option<Sender<IndexerEvent>> {
     let (tx, rx) = crossbeam_channel::unbounded();
     let tx_clone = tx.clone();
+
+    // Spawn signal handler to trigger graceful shutdown on Ctrl+C
+    let tx_signal = tx.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("Received Ctrl+C, triggering graceful shutdown");
+            let _ = tx_signal.send(IndexerEvent::Shutdown);
+        }
+    });
+
     std::thread::spawn(move || {
         let db_path = db.unwrap_or_else(|| data_dir.join("agent_search.db"));
         let opts = IndexOptions {
