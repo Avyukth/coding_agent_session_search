@@ -8,6 +8,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use super::rate_limit::RateLimiter;
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RangeQuery, RegexQuery, TermQuery};
 use tantivy::schema::{IndexRecordOption, Term, Value};
@@ -576,6 +578,8 @@ pub struct SearchClient {
     _shared_filters: Arc<Mutex<()>>, // placeholder lock to ensure Send/Sync; future warm prefill state
     metrics: Metrics,
     cache_namespace: String,
+    /// Rate limiter to prevent search resource exhaustion (10 req/sec, 20 burst)
+    rate_limiter: RateLimiter,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1314,6 +1318,7 @@ impl SearchClient {
             _shared_filters: shared_filters,
             metrics,
             cache_namespace,
+            rate_limiter: RateLimiter::default_search(),
         }))
     }
 
@@ -1324,6 +1329,13 @@ impl SearchClient {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<SearchHit>> {
+        // Rate limit to prevent resource exhaustion (blocks up to 1s if exceeded)
+        if !self.rate_limiter.acquire() {
+            return Err(anyhow::anyhow!(
+                "Rate limit exceeded: too many search requests"
+            ));
+        }
+
         let sanitized = sanitize_query(query);
 
         // Schedule warmup for likely prefixes when user pauses typing.
@@ -2295,6 +2307,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            rate_limiter: RateLimiter::default_search(),
         };
 
         let hits = vec![SearchHit {
@@ -2755,6 +2768,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            rate_limiter: RateLimiter::default_search(),
         };
 
         let hits = client.search("*handler", SearchFilters::default(), 5, 0)?;
@@ -2869,6 +2883,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            rate_limiter: RateLimiter::default_search(),
         };
 
         let hit = SearchHit {
@@ -2918,6 +2933,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            rate_limiter: RateLimiter::default_search(),
         };
 
         let hit = SearchHit {
@@ -2963,6 +2979,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            rate_limiter: RateLimiter::default_search(),
         };
 
         client.metrics.inc_cache_hits();
@@ -2994,6 +3011,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            rate_limiter: RateLimiter::default_search(),
         };
 
         let hit = SearchHit {
@@ -3050,6 +3068,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            rate_limiter: RateLimiter::default_search(),
         };
 
         // Large content to exceed byte cap quickly
@@ -3726,6 +3745,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
+            rate_limiter: RateLimiter::default_search(),
         };
 
         let result = client.search_with_fallback("ghost", SearchFilters::default(), 5, 0, 3)?;
@@ -3800,6 +3820,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
+            rate_limiter: RateLimiter::default_search(),
         };
 
         let result = client.search_with_fallback("ghost", SearchFilters::default(), 5, 10, 3)?;
@@ -3834,6 +3855,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
+            rate_limiter: RateLimiter::default_search(),
         };
 
         let mut filters = SearchFilters::default();
@@ -4356,6 +4378,7 @@ mod tests {
             _shared_filters: Arc::new(Mutex::new(())),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            rate_limiter: RateLimiter::default_search(),
         };
 
         let filters_empty = SearchFilters::default();
