@@ -122,6 +122,10 @@ impl Connector for OpenCodeConnector {
     }
 }
 
+/// Allowed column names for ORDER BY clauses to prevent SQL injection.
+/// Only known-safe OpenCode schema columns are permitted.
+const ALLOWED_ORDER_COLUMNS: &[&str] = &["created_at", "timestamp", "ts", "id"];
+
 fn load_db(
     conn: &Connection,
     db_path: &PathBuf,
@@ -148,7 +152,7 @@ fn load_db(
     let msg_cols = table_columns(conn, "messages")?;
     let order_col = msg_cols
         .iter()
-        .find(|c| c.as_str() == "created_at" || c.as_str() == "timestamp" || c.as_str() == "ts")
+        .find(|c| ALLOWED_ORDER_COLUMNS.contains(&c.as_str()))
         .cloned();
     let sql = match order_col {
         Some(col) => format!("SELECT * FROM messages ORDER BY {col}"),
